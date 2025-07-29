@@ -5,6 +5,8 @@ import smplx
 from data_loaders.motion_representation import *
 import pickle as pkl
 from utils.other_utils import REPR_LIST, REPR_DIM_DICT
+from pathlib import Path
+import hashlib
 
 
 
@@ -27,6 +29,7 @@ class DataloaderAMASS(data.Dataset):
                  loaded_smplx_noise_dict=None,
                  task='traj',
                  clip_len=150, joints_num=22,
+                 disable_cache=False,
                  logdir=None, device='cpu'):
         self.preprocessed_amass_root = preprocessed_amass_root
         self.split = split
@@ -34,6 +37,7 @@ class DataloaderAMASS(data.Dataset):
         self.logdir = logdir
         self.device = device
         self.spacing = spacing
+        self.disable_cache = disable_cache
         self.smplx_neutral = smplx.create(model_path=body_model_path, model_type="smplx",
                                           gender='neutral', flat_hand_mean=True, use_pca=False).to(self.device)
 
@@ -68,12 +72,13 @@ class DataloaderAMASS(data.Dataset):
                                         'smplx_rot_6d', 'smplx_trans']
         self.local_repr_name_list = ['local_positions', 'local_vel',
                                      'smplx_body_pose_6d', 'smplx_betas', 'foot_contact', ]
+        self.repr_list = self.traj_repr_name_list + self.local_repr_name_list
 
         ## get dimensions for features
         self.body_feat_dim = 0
         self.traj_feat_dim = 0
         self.pose_feat_dim = 0
-        for repr_name in REPR_LIST:
+        for repr_name in self.repr_list:
             self.body_feat_dim += REPR_DIM_DICT[repr_name]
             if repr_name in self.traj_repr_name_list:
                 self.traj_feat_dim += REPR_DIM_DICT[repr_name]
@@ -81,7 +86,7 @@ class DataloaderAMASS(data.Dataset):
                 self.pose_feat_dim += REPR_DIM_DICT[repr_name]
 
         self.repr_list_dict = {}
-        for repr_name in REPR_LIST:
+        for repr_name in self.repr_list:
             self.repr_list_dict[repr_name] = []
         self.smplx_params_list_dict = {}  # each item: params of all samples
         for param_name in ['global_orient', 'transl', 'body_pose', 'betas']:
@@ -91,16 +96,148 @@ class DataloaderAMASS(data.Dataset):
         if self.input_noise and (not self.sep_noise):
             self.joints_noisy_list = []
             self.repr_list_dict_noisy = {}
-            for repr_name in REPR_LIST:
+            for repr_name in self.repr_list:
                 self.repr_list_dict_noisy[repr_name] = []
 
         self.joints_clip_list = []
         self.smplx_clip_list = []
 
+
+        if not self.disable_cache:
+            # Add cache-related attributes
+            self.cache_dir = Path(preprocessed_amass_root) / '.cache'
+            self.cache_dir.mkdir(exist_ok=True)
+            
+            # Create a unique cache key based on all relevant parameters
+            cache_params = {
+                'spacing': spacing,
+                'split': split,
+                'clip_len': clip_len,
+                'input_noise': input_noise,
+                'sep_noise': sep_noise,
+                'noise_std_joint': noise_std_joint,
+                'noise_std_params': self.noise_std_params_dict,
+                'load_noise': load_noise,
+                'repr_abs_only': repr_abs_only,
+                'amass_datasets': sorted(amass_datasets),
+                'joints_num': joints_num,
+            }
+            
+            # Create deterministic cache key
+            cache_key = self._get_cache_key(cache_params)
+            self.cache_file = self.cache_dir / f"{cache_key}.pkl"
+            
+            # Try to load from cache first
+            if self._try_load_cache():
+                print(f"[INFO] Loaded dataset from cache: {self.cache_file}")
+                # FIXME: if cache is valid and split == 'train', AMASS_mean.pkl and AMASS_std.pkl should be written to disk, otherwise there would be not AMASS_mean.pkl and AMASS_std.pkl under logdir, and 'test' split dataset loading operation would fail with error.
+                # This is a workaround to ensure that the mean/std stats are always saved when the dataset is initialized. But it would eat up disk space.
+                if self.split == 'train':
+                    save_dir = self.logdir
+                    os.makedirs(save_dir) if not os.path.exists(save_dir) else None
+                    with open(os.path.join(save_dir, 'AMASS_mean.pkl'), 'wb') as result_file:
+                        pkl.dump(self.Mean_dict, result_file, protocol=2)
+                    with open(os.path.join(save_dir, 'AMASS_std.pkl'), 'wb') as result_file:
+                        pkl.dump(self.Std_dict, result_file, protocol=2)
+                return
+            
+        # If cache miss or invalid or <self.disable_cache>, proceed with normal initialization
+        
         ######################################## read data and compute the motion reprentations
         self.read_data(amass_datasets)
         self.create_body_repr()
 
+        if not self.disable_cache:
+            # Save to cache after initialization
+            self._save_to_cache()
+
+    def _get_cache_key(self, params):
+        """Generate a deterministic hash key from parameters."""
+        # Convert params to a canonical string representation
+        param_str = json.dumps(params, sort_keys=True)
+        return hashlib.sha256(param_str.encode()).hexdigest()[:16]
+
+    def _try_load_cache(self):
+        """Attempt to load dataset state from cache."""
+        if not self.cache_file.exists():
+            return False
+            
+        try:
+            with open(self.cache_file, 'rb') as f:
+                cache_data = pkl.load(f)
+                
+            # Verify cache version and parameters match
+            if cache_data.get('version') != '0':  # Increment this when cache format changes
+                return False
+                
+            # Load all cached attributes
+            cached_attrs = [
+                'joints_clip_list',
+                'smplx_clip_list',
+                'n_samples',
+                'joints_clean_list',
+                'repr_list_dict',
+                'smplx_params_list_dict',
+                'Mean_dict',
+                'Std_dict',
+                'Mean',
+                'Std',
+            ]
+            
+            if self.input_noise and not self.sep_noise:
+                cached_attrs.extend([
+                    'joints_noisy_list',
+                    'repr_list_dict_noisy'
+                ])
+                
+            for attr in cached_attrs:
+                if attr not in cache_data:
+                    return False
+                setattr(self, attr, cache_data[attr])
+                
+            return True
+            
+        except (EOFError, pkl.UnpicklingError, KeyError) as e:
+            # Handle corrupt cache files
+            self.cache_file.unlink(missing_ok=True)
+            return False
+
+    def _save_to_cache(self):
+        """Save current dataset state to cache."""
+        cache_data = {
+            'version': '0',  # Cache version for future compatibility
+            'joints_clip_list': self.joints_clip_list,
+            'smplx_clip_list': self.smplx_clip_list,
+            'n_samples': self.n_samples,
+            'joints_clean_list': self.joints_clean_list,
+            'repr_list_dict': self.repr_list_dict,
+            'smplx_params_list_dict': self.smplx_params_list_dict,
+            'Mean_dict': self.Mean_dict,
+            'Std_dict': self.Std_dict,
+            'Mean': self.Mean,
+            'Std': self.Std,
+        }
+        
+        if self.input_noise and not self.sep_noise:
+            cache_data.update({
+                'joints_noisy_list': self.joints_noisy_list,
+                'repr_list_dict_noisy': self.repr_list_dict_noisy
+            })
+            
+        # Save cache atomically
+        temp_cache_file = self.cache_file.with_suffix('.tmp')
+        try:
+            with open(temp_cache_file, 'wb') as f:
+                pkl.dump(cache_data, f, protocol=4)
+            temp_cache_file.rename(self.cache_file)
+        finally:
+            temp_cache_file.unlink(missing_ok=True)
+
+    def clear_cache(self):
+        """Clear all cache files."""
+        if self.cache_dir.exists():
+            for cache_file in self.cache_dir.glob('*.pkl'):
+                cache_file.unlink()
 
     def divide_clip(self, dataset_name='HumanEva'):
         preprocessed_amass_joints_dir = os.path.join(self.preprocessed_amass_root, 'pose_data_fps_30')
@@ -216,14 +353,14 @@ class DataloaderAMASS(data.Dataset):
 
             ############### clean data repr gt
             self.joints_clean_list.append(cano_positions)
-            for repr_name in REPR_LIST:
+            for repr_name in self.repr_list:
                 self.repr_list_dict[repr_name].append(repr_dict[repr_name])
             for param_name in ['global_orient', 'transl', 'body_pose', 'betas']:
                 self.smplx_params_list_dict[param_name].append(cano_smplx_params_dict[param_name])
 
             if self.input_noise and (not self.sep_noise):
                 self.joints_noisy_list.append(cano_positions_noisy)
-                for repr_name in REPR_LIST:
+                for repr_name in self.repr_list:
                     self.repr_list_dict_noisy[repr_name].append(repr_dict_noisy[repr_name])
 
 
@@ -246,12 +383,12 @@ class DataloaderAMASS(data.Dataset):
 
         #######################################  get mean/std for dataset
         save_dir = self.logdir
-        for repr_name in REPR_LIST:
+        for repr_name in self.repr_list:
             self.repr_list_dict[repr_name] = np.asarray(self.repr_list_dict[repr_name])  # each item: [N, T-1, d]
         if self.split == 'train':
             self.Mean_dict = {}
             self.Std_dict = {}
-            for repr_name in REPR_LIST:
+            for repr_name in self.repr_list:
                 self.Mean_dict[repr_name] = self.repr_list_dict[repr_name].reshape(-1, REPR_DIM_DICT[repr_name]).mean(axis=0).astype(np.float32)
                 if repr_name == 'foot_contact':
                     self.Mean_dict[repr_name][...] = 0.0
@@ -285,7 +422,7 @@ class DataloaderAMASS(data.Dataset):
     def __getitem__(self, index):
         positions_clean = self.joints_clean_list[index]
         repr_dict_clean = {}
-        for repr_name in REPR_LIST:
+        for repr_name in self.repr_list:
             repr_dict_clean[repr_name] = self.repr_list_dict[repr_name][index]  # [clip_len, d]
 
         ####################################### add noise
@@ -311,15 +448,15 @@ class DataloaderAMASS(data.Dataset):
                 ## add noise to smplx params, and noisy joints obtained by FK (our setup)
                 positions_noisy = self.joints_noisy_list[index]
                 repr_dict_noisy = {}
-                for repr_name in REPR_LIST:
+                for repr_name in self.repr_list:
                     repr_dict_noisy[repr_name] = self.repr_list_dict_noisy[repr_name][index]  # [clip_len, d]
 
         ####################################### get data items
         item_dict = {}
-        item_dict['motion_repr_clean'] = np.concatenate([repr_dict_clean[key] for key in REPR_LIST], axis=-1) # [clip_len-1, 263]
+        item_dict['motion_repr_clean'] = np.concatenate([repr_dict_clean[key] for key in self.repr_list], axis=-1) # [clip_len-1, 263]
         if self.input_noise:
             item_dict['noisy_joints'] = positions_noisy
-            item_dict['motion_repr_noisy'] = np.concatenate([repr_dict_noisy[key] for key in REPR_LIST], axis=-1) # [clip_len-1, 263]
+            item_dict['motion_repr_noisy'] = np.concatenate([repr_dict_noisy[key] for key in self.repr_list], axis=-1) # [clip_len-1, 263]
             if self.task == 'pose':  # PoseNet conditioned on clean traj input
                 item_dict['motion_repr_noisy'][:, 0:self.traj_feat_dim] = item_dict['motion_repr_clean'][:, 0:self.traj_feat_dim]
         else:
@@ -328,14 +465,26 @@ class DataloaderAMASS(data.Dataset):
         item_dict['motion_repr_clean'] = ((item_dict['motion_repr_clean'] - self.Mean) / self.Std).astype(np.float32)
         item_dict['motion_repr_noisy'] = ((item_dict['motion_repr_noisy'] - self.Mean) / self.Std).astype(np.float32)
 
+        # NOTE: TrajNet's conditioning information should be `local_positions` and `local_velocities`, PoseNet's conditioning information should be clean trajectory concatenated with `local_positions` and `local_velocities`.
+        key = 'motion_repr_noisy' if self.input_noise else 'motion_repr_clean'
+        lpos = item_dict[key][:, self.traj_feat_dim:self.traj_feat_dim + REPR_DIM_DICT['local_positions']]
+        lcond = lpos
+        if not self.repr_abs_only:
+            # FIXME: this assumes `local_vel` follows immediately after `local_positions`.
+            lvel = item_dict[key][:, self.traj_feat_dim + REPR_DIM_DICT['local_positions']:self.traj_feat_dim + REPR_DIM_DICT['local_positions'] + REPR_DIM_DICT['local_vel']]
+            lcond = np.concatenate([lpos, lvel], axis=-1)  # [clip_len-1, 22*3+22*6]
+
         if self.task == 'traj':
+            item_dict['cond'] = lcond  # condition of TrajNet: local positions and velocities
+            item_dict['control_cond'] = item_dict['motion_repr_clean'][:, -self.pose_feat_dim:]  # TrajControl signal: clean local pose features
+        elif self.task == 'pose':
+            key = 'motion_repr_clean' # NOTE: PoseNet's conditioning information should be clean trajectory since 1. During inference, we subsititute pose_batch['cond']'s trajectory parts with TrajNet's output. 2. We assume TrajNet's output is clean trajectory due to our objectives.
             if not self.repr_abs_only:
-                noisy_traj = item_dict['motion_repr_noisy'][:, 0:self.traj_feat_dim]
+                clean_traj = item_dict[key][:, 0:self.traj_feat_dim]
             else:
                 # if repr_abs_only=False, exclude traj velocities
-                temp = item_dict['motion_repr_noisy']
-                noisy_traj = np.concatenate([temp[..., [0]], temp[..., 2:4], temp[..., [6]], temp[..., 7:13], temp[..., 16:19]], axis=-1)  # [144, 13]
-            item_dict['cond'] = noisy_traj  # condition of TrajNet: noisy trajectory
-            item_dict['control_cond'] = item_dict['motion_repr_clean'][:, -self.pose_feat_dim:]  # PoseControl signal: clean local pose features
-
+                temp = item_dict[key]
+                clean_traj = np.concatenate([temp[..., [0]], temp[..., 2:4], temp[..., [6]], temp[..., 7:13], temp[..., 16:19]], axis=-1)  # [144, 13]
+            item_dict['cond'] = np.concatenate([clean_traj, lcond], axis=-1)
+            
         return item_dict

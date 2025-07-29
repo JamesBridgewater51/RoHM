@@ -22,6 +22,7 @@ group = configargparse.ArgParser(formatter_class=arg_formatter,
                                       prog='')
 group.add_argument('--config', is_config_file=True, default='', help='config file path')
 group.add_argument("--device", default=0, type=int, help="Device id to use.")
+group.add_argument('--run_name', type=str, default='baselines/RoHM', help='path to datas')
 # group.add_argument("--seed", default=0, type=int, help="For fixing random seed.")
 
 ######################## diffusion setups
@@ -68,6 +69,8 @@ group.add_argument('--debug', default='False', type=lambda x: x.lower() in ['tru
 group.add_argument("--max_infill_ratio", default=0.1, type=float, help="maximum occlusion ratio for traj infilling")
 group.add_argument("--mask_prob", default=0.4, type=float, help="probability to apply occlusion mask for traj infilling")
 group.add_argument("--start_infill_epoch", default=100000000000000000000, type=int, help="which epoch to start traj infilling")
+group.add_argument("--mask_scheme", default='upper_body', type=str,
+                   choices=['head_only', 'lower_body', 'upper_body', 'head_with_two_hands', 'head_with_two_hands_and_two_feets'])
 group.add_argument("--save_dir", default='runs', type=str, help="Path to save checkpoints and results.")
 group.add_argument("--lr", default=1e-4, type=float, help="Learning rate.")
 group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
@@ -125,8 +128,9 @@ def main(args, writer, logdir, logger):
 
 
     print("creating model and diffusion...")
+    traj_cond_dim = 22*3 if args.repr_abs_only else 22*3+22*3
     model = TrajNet(time_dim=32, mid_dim=512,
-                    cond_dim=train_dataset.traj_feat_dim, traj_feat_dim=train_dataset.traj_feat_dim,
+                    cond_dim=traj_cond_dim, traj_feat_dim=train_dataset.traj_feat_dim,
                     trajcontrol=args.trajcontrol,
                     device=dist_util.dev(),
                     dataset=train_dataset,
@@ -190,12 +194,11 @@ def main(args, writer, logdir, logger):
                      timestep_respacing_eval=args.timestep_respacing_eval,
                      start_infill_epoch=args.start_infill_epoch, max_infill_ratio=args.max_infill_ratio, mask_prob=args.mask_prob,
                      train_dataloader=train_dataloader, test_dataloader=test_dataloader,
-                     logdir=logdir, logger=logger, device=dist_util.dev()
+                     logdir=logdir, logger=logger, mask_scheme=args.mask_scheme, device=dist_util.dev()
                      ).run_loop()
 
 if __name__ == "__main__":
-    run_id = random.randint(1, 100000)
-    logdir = os.path.join(args.save_dir, str(run_id))  # create new path
+    logdir = os.path.join(args.save_dir, args.run_name)  
     writer = SummaryWriter(log_dir=logdir)
     print('RUNDIR: {}'.format(logdir))
     sys.stdout.flush()

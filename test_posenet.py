@@ -15,6 +15,7 @@ from diffusion import gaussian_diffusion_posenet
 from diffusion.respace import SpacedDiffusionPoseNet
 from utils.model_util import create_gaussian_diffusion
 from utils.vis_util import *
+from utils.data_util import mask_batch_cond
 import smplx
 
 
@@ -36,6 +37,7 @@ group.add_argument('--dataset_root', type=str, default='/mnt/hdd/diffusion_mocap
 ####################### model setups
 group.add_argument('--task', default='pose', type=str, choices=['traj', 'pose'])
 group.add_argument("--clip_len", default=145, type=int, help="sequence length for each clip")
+group.add_argument('--repr_abs_only', default='True', type=lambda x: x.lower() in ['true', '1'], help='if True, only include absolute trajectory repr for TrajNet')
 group.add_argument('--model_path', type=str, default='checkpoints/posenet_checkpoint/model000200000.pt', help='')
 
 ######################## input noise scaling setups
@@ -48,7 +50,7 @@ group.add_argument("--noise_std_smplx_betas", default=0.2, type=float, help="noi
 ####################### test setups
 group.add_argument("--batch_size", default=32, type=int, help="Batch size during test.")
 group.add_argument('--cond_fn_with_grad', default='False', type=lambda x: x.lower() in ['true', '1'], help='use test-time guidance or not')
-group.add_argument("--mask_scheme", default='lower', type=str, choices=['lower', 'upper', 'full'], help='occlusion setup for test')
+group.add_argument("--mask_scheme", default='upper_body', type=str, choices=['head_only', 'lower_body', 'upper_body', 'head_with_two_hands', 'head_with_two_hands_and_two_feets'], help='occlusion setup for test')
 group.add_argument('--visualize', default='True', type=lambda x: x.lower() in ['true', '1'])
 group.add_argument("--vis_interval", default=50, type=int, help="visualize every N clips")
 group.add_argument('--save_results', default='False', type=lambda x: x.lower() in ['true', '1'], help='save test results')
@@ -81,11 +83,13 @@ def main(args):
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, drop_last=False)
 
     print("creating model and diffusion...")
-    model = PoseNet(dataset=test_dataset, body_feat_dim=test_dataset.body_feat_dim,
+    pose_cond_dim = 22*3 + test_dataset.traj_feat_dim if args.repr_abs_only else 22*3+22*3+test_dataset.traj_feat_dim
+    model = PoseNet(dataset=test_dataset, cond_feat_dim=pose_cond_dim, body_feat_dim=test_dataset.body_feat_dim,
                     latent_dim=512, ff_size=1024, num_layers=8, num_heads=4, dropout=0.1, activation="gelu",
                     body_model_path=args.body_model_path,
                     device=dist_util.dev(),
                     traj_feat_dim=test_dataset.traj_feat_dim,
+                    repr_abs_only=args.repr_abs_only,
                     ).to(dist_util.dev())
 
     print('[INFO] loaded model path:', args.model_path)
@@ -133,43 +137,12 @@ def main(args):
     for test_step, test_batch in tqdm(enumerate(test_dataloader)):
         for key in test_batch.keys():
             test_batch[key] = test_batch[key].to(dist_util.dev())
-        if not args.input_noise:
-            test_batch['cond'] = test_batch['motion_repr_clean'].clone()  # [bs, clip_len, body_feat_dim]
-        else:
-            test_batch['cond'] = test_batch['motion_repr_noisy'].clone()
+
+        mask_joint_ids = set(range(22)) - set(MOCAP_VIS_MASK_IDS[args.mask_scheme])
+        mask_joint_ids = np.asarray(list(mask_joint_ids))
+        test_batch = mask_batch_cond(batch=test_batch, task=args.task, args=args, mask_joint_ids=mask_joint_ids, num_joints=22, traj_feat_dim=test_dataset.traj_feat_dim)
+
         bs, clip_len = test_batch['motion_repr_clean'].shape[0], test_batch['motion_repr_clean'].shape[1]
-
-        ######################## mask out lower body part
-        if args.mask_scheme == 'lower':
-            mask_joint_id = np.asarray([1, 2, 4, 5, 7, 8, 10, 11])
-            for k in range(3):
-                test_batch['cond'][:, :, test_dataset.traj_feat_dim + mask_joint_id * 3 + k] = 0.
-            for k in range(3):
-                test_batch['cond'][:, :, test_dataset.traj_feat_dim + 22 * 3 + mask_joint_id * 3 + k] = 0.
-            for k in range(6):
-                test_batch['cond'][:, :, test_dataset.traj_feat_dim + 22 * 3 + 22 * 3 + (mask_joint_id - 1) * 6 + k] = 0.
-            test_batch['cond'][:, :, -4:] = 0.
-
-        ######################## mask out upper body part
-        if args.mask_scheme == 'upper':
-            mask_joint_id = np.asarray([3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20])
-            for k in range(3):
-                test_batch['cond'][:, :, test_dataset.traj_feat_dim + mask_joint_id * 3 + k] = 0.
-            for k in range(3):
-                test_batch['cond'][:, :, test_dataset.traj_feat_dim + 22 * 3 + mask_joint_id * 3 + k] = 0.
-            for k in range(6):
-                test_batch['cond'][:, :, test_dataset.traj_feat_dim + 22 * 3 + 22 * 3 + (mask_joint_id - 1) * 6 + k] = 0.
-            test_batch['cond'][:, :, -4:] = 0.
-
-        ######################## mask out full body for certain ratio of frames
-        if args.mask_scheme == 'full':
-            start = torch.FloatTensor(bs).uniform_(0, clip_len - 1).long()  # [bs]
-            mask_len = 30
-            end = start + mask_len
-            end[end > clip_len] = clip_len
-            test_batch['cond'][:, :, -4:] = 0.
-            for idx in range(bs):
-                test_batch['cond'][idx, start[idx]:end[idx], 22:] = 0
 
         ######################## test forward
         test_batch['motion_repr_clean'] = torch.permute(test_batch['motion_repr_clean'], (0, 2, 1)).unsqueeze(-2)  # [bs, body_feat_dim, 1, clip_len]
@@ -196,7 +169,7 @@ def main(args):
         ###### clean motion
         cur_total_dim = 0
         repr_dict_clean = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_dataset.repr_list:
             repr_dict_clean[repr_name] = motion_repr_clean[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_clean[repr_name] = torch.from_numpy(repr_dict_clean[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -206,7 +179,7 @@ def main(args):
         ###### rec motion from abs traj / smpl params
         cur_total_dim = 0
         repr_dict_rec = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_dataset.repr_list:
             repr_dict_rec[repr_name] = motion_repr_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_rec[repr_name] = torch.from_numpy(repr_dict_rec[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -219,7 +192,7 @@ def main(args):
         if args.input_noise:
             cur_total_dim = 0
             repr_dict_noisy = {}
-            for repr_name in REPR_LIST:
+            for repr_name in test_dataset.repr_list:
                 repr_dict_noisy[repr_name] = motion_repr_noisy[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
                 repr_dict_noisy[repr_name] = torch.from_numpy(repr_dict_noisy[repr_name]).to(dist_util.dev())
                 cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -239,7 +212,7 @@ def main(args):
             motion_repr_rec_list.append(motion_repr_rec)
 
             save_data = {}
-            save_data['repr_name_list'] = REPR_LIST
+            save_data['repr_name_list'] = test_dataset.repr_list
             save_data['repr_dim_dict'] = REPR_DIM_DICT
             save_data['rec_ric_data_clean_list'] = np.concatenate(rec_ric_data_clean_list, axis=0)
             if args.input_noise:
@@ -270,10 +243,7 @@ def main(args):
                 if bs % args.vis_interval == 0:
                     for t in range(len(rec_ric_data_rec_from_abs_traj[bs])):
                         ############################################# body skeletons
-                        if args.mask_scheme == 'lower' or args.mask_scheme == 'upper':
-                            cur_mask_joint_id = mask_joint_id.tolist()
-                        else:
-                            cur_mask_joint_id = None
+                        cur_mask_joint_id = mask_joint_ids.tolist()
                         skeleton_gt_list = vis_skeleton(joints=rec_ric_data_clean[bs, t], limbs=LIMBS_BODY_SMPL,
                                                         add_trans=np.array([0, 2.0, 2.5]))
                         skeleton_rec_list = vis_skeleton(joints=rec_ric_data_rec_from_smpl[bs, t],

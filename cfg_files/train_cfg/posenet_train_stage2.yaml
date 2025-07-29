@@ -28,8 +28,9 @@ weight_loss_foot_skating: 0.1
 
 batch_size: 64
 debug: False
-start_prox_mask_epoch: 500
-mask_scheme: 'lower+upper+full'
+# NOTE: set start_prox_mask_epoch to -1 to disable prox mask scheme
+start_prox_mask_epoch: -1
+mask_scheme: 'upper_body'
 save_dir: 'runs'  # todo
 lr: 1e-4
 weight_decay: 0.0

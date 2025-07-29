@@ -21,7 +21,7 @@ group.add_argument('--body_model_path', type=str, default='data/body_models/smpl
 group.add_argument('--saved_data_path', type=str,
                    default='data/test_results_release/results_amass_full/test_amass_full_grad_True_mask_lower_noise_3_iter_2_iter2trajnoisy_True_iter2posenoisy_True_earlystop_False_seed_0.pkl',
                    help='path to saved test results')
-group.add_argument("--mask_scheme", default='lower', type=str, choices=['lower', 'full'], help='occlusion setup for test, full denotes traj+body occluded together')
+group.add_argument("--mask_scheme", default='upper_body', type=str, choices=['head_only', 'lower_body', 'upper_body', 'head_with_two_hands', 'head_with_two_hands_and_two_feets'], help='occlusion setup for test, full denotes traj+body occluded together')
 group.add_argument("--traj_mask_ratio", default=0.0, type=float, help="occlusion ratio for traj infilling, when traj is occlude, we assume full body pose is also occluded")
 
 group.add_argument('--visualize', default='False', type=lambda x: x.lower() in ['true', '1'])

@@ -261,7 +261,7 @@ def main(args):
             ################ reconstruct full traj repr (including both absolute and relative repr)
             cur_total_dim = 0
             repr_dict_clean_root_rec = {}
-            for repr_name in REPR_LIST:
+            for repr_name in test_traj_dataset.repr_list:
                 repr_dict_clean_root_rec[repr_name] = motion_repr_input_root_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
                 repr_dict_clean_root_rec[repr_name] = torch.from_numpy(repr_dict_clean_root_rec[repr_name]).to(dist_util.dev())
                 cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -280,7 +280,7 @@ def main(args):
                                      'betas': repr_dict_clean_root_rec['smplx_betas'][seq_i].detach().cpu().numpy(), }
                 repr_dict = get_repr_smplx(positions=rec_ric_data_rec_from_smpl[seq_i], smplx_params_dict=smplx_params_dict,
                                            feet_vel_thre=5e-5)  # a dict of reprs
-                new_motion_repr_clean_root_rec = np.concatenate([repr_dict[key] for key in REPR_LIST], axis=-1)
+                new_motion_repr_clean_root_rec = np.concatenate([repr_dict[key] for key in test_traj_dataset.repr_list], axis=-1)
                 new_motion_repr_clean_root_rec = (new_motion_repr_clean_root_rec - test_pose_dataset.Mean) / test_pose_dataset.Std
                 traj_rec_full.append(new_motion_repr_clean_root_rec[:, 0:22])
             traj_rec_full = np.asarray(traj_rec_full)  # [bs, 143, 22]
@@ -334,7 +334,7 @@ def main(args):
         ###### noisy/occluded input motion
         cur_total_dim = 0
         repr_dict_noisy = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_pose_dataset.repr_list:
             repr_dict_noisy[repr_name] = motion_repr_noisy[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_noisy[repr_name] = torch.from_numpy(repr_dict_noisy[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -344,7 +344,7 @@ def main(args):
         ###### rec motion from abs traj / smpl params
         cur_total_dim = 0
         repr_dict_rec = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_pose_dataset.repr_list:
             repr_dict_rec[repr_name] = motion_repr_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_rec[repr_name] = torch.from_numpy(repr_dict_rec[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -370,7 +370,7 @@ def main(args):
         if args.dataset == 'egobody':
             save_data['gender_gt'] = test_pose_dataset.gender_gt
             save_data['joints_gt_scene_coord_list'] = np.concatenate(joints_gt_scene_coord_list, axis=0)
-        save_data['repr_name_list'] = REPR_LIST
+        save_data['repr_name_list'] = test_pose_dataset.repr_list
         save_data['repr_dim_dict'] = REPR_DIM_DICT
         save_data['frame_name_list'] = test_batch_pose['frame_name']
         save_data['trans_scene2cano_list'] = np.concatenate(trans_scene2cano_list, axis=0)

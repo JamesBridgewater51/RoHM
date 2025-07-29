@@ -15,6 +15,8 @@ from diffusion.respace import SpacedDiffusionPoseNet, SpacedDiffusionTrajNet
 from utils.model_util import create_gaussian_diffusion
 from utils.vis_util import *
 import smplx
+from utils.data_util import mask_batch_cond
+from utils.constants import MOCAP_MASK_SCHEME_CHOICES, MOCAP_VIS_MASK_IDS      
 
 arg_formatter = configargparse.ArgumentDefaultsHelpFormatter
 cfg_parser = configargparse.YAMLConfigFileParser
@@ -59,9 +61,9 @@ group.add_argument("--batch_size", default=32, type=int, help="Batch size during
 group.add_argument('--cond_fn_with_grad', default='True', type=lambda x: x.lower() in ['true', '1'], help='use test-time guidance or not')
 group.add_argument('--infill_traj', default='False', type=lambda x: x.lower() in ['true', '1'])
 group.add_argument("--traj_mask_ratio", default=0.1, type=float, help="occlusion ratio for traj infilling, when traj is occlude, we assume full body pose is also occluded")
-group.add_argument("--mask_scheme", default='full', type=str, choices=['lower', 'upper', 'full'], help='occlusion scheme for poseNet')
+group.add_argument("--mask_scheme", default='upper_body', type=str, choices=['head_only', 'lower_body', 'upper_body', 'head_with_two_hands', 'head_with_two_hands_and_two_feets'], help='occlusion scheme for poseNet')
 group.add_argument('--save_root', type=str, default='test_results/results_amass_full', help='')
-
+"""  """
 group.add_argument("--sample_iter", default=2, type=int, help="how many inference iterations during test, default is 2 for results in paper")
 group.add_argument("--iter2_cond_noisy_traj", default='True', type=lambda x: x.lower() in ['true', '1'],
                    help='in inference iteration>1, if TrajNet conditions on noisy input instead of predicted traj from inderence iteration 1')
@@ -129,11 +131,13 @@ def main(args):
 
     print("creating model and diffusion...")
     #################### set up PoseNet
-    model_posenet = PoseNet(dataset=test_pose_dataset, body_feat_dim=test_pose_dataset.body_feat_dim,
+    pose_cond_dim = 22*3 + test_traj_dataset.traj_feat_dim if args.repr_abs_only else 22*3+22*3+test_traj_dataset.traj_feat_dim
+    model_posenet = PoseNet(dataset=test_pose_dataset, cond_feat_dim =pose_cond_dim, body_feat_dim=test_pose_dataset.body_feat_dim,
                             latent_dim=512, ff_size=1024, num_layers=8, num_heads=4, dropout=0.1, activation="gelu",
                             body_model_path=args.body_model_path,
                             device=dist_util.dev(),
                             traj_feat_dim=test_pose_dataset.traj_feat_dim,
+                            repr_abs_only=args.repr_abs_only,
                             ).to(dist_util.dev())
 
     print('[INFO] loaded PoseNet checkpoint path:', args.model_path_posenet)
@@ -148,8 +152,9 @@ def main(args):
                                                        device=dist_util.dev())
 
     #################### set up TrajNet
+    traj_feat_dim = 22*3 if args.repr_abs_only else 22*3+22*3
     model_trajnet = TrajNet(time_dim=32, mid_dim=512,
-                    cond_dim=test_traj_dataset.traj_feat_dim,
+                    cond_dim=traj_feat_dim,
                     traj_feat_dim=test_traj_dataset.traj_feat_dim,
                     trajcontrol=False,
                     device=dist_util.dev(),
@@ -158,7 +163,7 @@ def main(args):
                     ).to(dist_util.dev())
 
     model_trajnet_control = TrajNet(time_dim=32, mid_dim=512,
-                            cond_dim=test_traj_dataset.traj_feat_dim,
+                            cond_dim=traj_feat_dim,
                             traj_feat_dim=test_traj_dataset.traj_feat_dim,
                             trajcontrol=True,
                             device=dist_util.dev(),
@@ -216,6 +221,7 @@ def main(args):
             test_batch_traj[key] = test_batch_traj[key].to(dist_util.dev())
 
         if args.infill_traj:
+            raise DeprecationWarning("Infilling task is not supported currently.")
             clip_len = test_batch_traj['cond'].shape[1]
             batch_size = test_batch_traj['cond'].shape[0]
             mask_traj = torch.ones(batch_size, clip_len).to(dist_util.dev())  # [bs, T]
@@ -228,9 +234,16 @@ def main(args):
             mask_traj = mask_traj.unsqueeze(-1).repeat(1, 1, test_traj_dataset.traj_feat_dim)  # [bs, T, traj_feat_dim]
             test_batch_traj['cond'][:, :, 0:test_traj_dataset.traj_feat_dim] = test_batch_traj['cond'][:, :, 0:test_traj_dataset.traj_feat_dim] * mask_traj
 
+        
+        mask_joint_ids = set(range(22)) - set(MOCAP_VIS_MASK_IDS[args.mask_scheme])
+        mask_joint_ids = np.asarray(list(mask_joint_ids))
+        test_batch_traj = mask_batch_cond(batch=test_batch_traj, task='traj', args=args, mask_joint_ids=mask_joint_ids, num_joints=22, traj_feat_dim=test_traj_dataset.traj_feat_dim)
+        test_batch_pose = mask_batch_cond(batch=test_batch_pose, task='pose', args=args, mask_joint_ids=mask_joint_ids, num_joints=22, traj_feat_dim=test_pose_dataset.pose_feat_dim)
+
         for iter_idx in range(args.sample_iter):
             print('Inference iter {}...'.format(iter_idx))
             if args.iter2_cond_noisy_traj and args.infill_traj and iter_idx > 0:
+                raise DeprecationWarning("Infilling task is not supported currently.")
                 # for inference iter>0, TrajNet conditions on noisy visible input traj and predicted traj for occluded parts from last interence iteration
                 traj_vis = test_batch_traj['cond'][:, :, 0:test_traj_dataset.traj_feat_dim] * mask_traj
                 traj_occ = val_output_traj * (1-mask_traj)
@@ -249,7 +262,7 @@ def main(args):
                                                                         cond_fn_with_grad=args.cond_fn_with_grad,
                                                                         compute_loss=False,
                                                                         smplx_model=smplx_neutral)
-                traj_noisy_full = test_batch_traj['motion_repr_noisy'][:, :, 0:22].detach().cpu().numpy()
+                traj_noisy_full = test_batch_traj['motion_repr_noisy'][:, :, :test_traj_dataset.traj_feat_dim].detach().cpu().numpy()
             ################# for trajNet with trajControl
             else:
                 # copy local pose from PoseNet to TrajControl condition
@@ -265,107 +278,69 @@ def main(args):
                                                                                 compute_loss=False,
                                                                                 smplx_model=smplx_neutral)
 
-            ################# motion_repr_clean_root_rec: full repr with reconstructed traj repr, pose part from gt (but unused)
-            if not args.repr_abs_only:
-                motion_repr_clean_root_rec = torch.cat([val_output_traj, test_batch_traj['motion_repr_clean'][:, :, traj_feat_dim:]], dim=-1)  # [bs, 144, 294]
-            else:
-                motion_repr_clean_root_rec = test_batch_traj['motion_repr_clean'].clone()
-                motion_repr_clean_root_rec[..., 0] = val_output_traj[..., 0]
-                motion_repr_clean_root_rec[..., 2:4] = val_output_traj[..., 1:3]
-                motion_repr_clean_root_rec[..., 6] = val_output_traj[..., 3]
-                motion_repr_clean_root_rec[..., 7:13] = val_output_traj[..., 4:10]
-                motion_repr_clean_root_rec[..., 16:19] = val_output_traj[..., 10:13]
-            if iter_idx == 0:
-                test_batch_traj['motion_repr_noisy'] = motion_repr_clean_root_rec
-            if iter_idx < args.sample_iter - 1 and not args.iter2_cond_noisy_traj:
-                test_batch_traj['cond'] = val_output_traj
-            motion_repr_clean_root_rec = motion_repr_clean_root_rec.detach().cpu().numpy()
-            motion_repr_clean_root_rec = motion_repr_clean_root_rec * test_traj_dataset.Std + test_traj_dataset.Mean
-
-            ################ reconstruct full traj repr (including both absolute and relative repr)
-            cur_total_dim = 0
-            repr_dict_clean_root_rec = {}
-            for repr_name in REPR_LIST:
-                repr_dict_clean_root_rec[repr_name] = motion_repr_clean_root_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
-                repr_dict_clean_root_rec[repr_name] = torch.from_numpy(repr_dict_clean_root_rec[repr_name]).to(dist_util.dev())
-                cur_total_dim += REPR_DIM_DICT[repr_name]
-            rec_ric_data_rec_from_smpl, smpl_verts_rec = recover_from_repr_smpl(repr_dict_clean_root_rec, recover_mode='smplx_params', smplx_model=smplx_neutral, return_verts=True)
-            rec_ric_data_rec_from_smpl = rec_ric_data_rec_from_smpl.detach().cpu().numpy()
-
-            traj_rec_full = []
-            for seq_i in range(len(rec_ric_data_rec_from_smpl)):
-                global_orient_mat = rot6d_to_rotmat(repr_dict_clean_root_rec['smplx_rot_6d'][seq_i])  # [T, 3, 3]
-                global_orient_aa = rotation_matrix_to_angle_axis(global_orient_mat)  # [T, 3]
-                body_pose_mat = rot6d_to_rotmat(repr_dict_clean_root_rec['smplx_body_pose_6d'][seq_i].reshape(-1, 6))  # [T*21, 3, 3]
-                body_pose_aa = rotation_matrix_to_angle_axis(body_pose_mat).reshape(-1, 21, 3)  # [T, 21, 3]
-                smplx_params_dict = {'transl': repr_dict_clean_root_rec['smplx_trans'][seq_i].detach().cpu().numpy(),
-                                     'global_orient': global_orient_aa.detach().cpu().numpy(),
-                                     'body_pose': body_pose_aa.reshape(-1, 63).detach().cpu().numpy(),
-                                     'betas': repr_dict_clean_root_rec['smplx_betas'][seq_i].detach().cpu().numpy(), }
-                repr_dict = get_repr_smplx(positions=rec_ric_data_rec_from_smpl[seq_i], smplx_params_dict=smplx_params_dict,
-                                           feet_vel_thre=5e-5)  # a dict of reprs
-                new_motion_repr_clean_root_rec = np.concatenate([repr_dict[key] for key in REPR_LIST], axis=-1)
-                new_motion_repr_clean_root_rec = (new_motion_repr_clean_root_rec - test_pose_dataset.Mean) / test_pose_dataset.Std
-                traj_rec_full.append(new_motion_repr_clean_root_rec[:, 0:22])
-            traj_rec_full = np.asarray(traj_rec_full)  # [bs, 143, 22]
-            traj_rec_full = torch.tensor(traj_rec_full).to(dist_util.dev())
-
             ######################################### PoseNet forward  #####################################
             if iter_idx == 0:
                 test_batch_pose['motion_repr_noisy'] = test_batch_pose['motion_repr_noisy'][:, 0:-1]  # T=144-->143
                 test_batch_pose['motion_repr_clean'] = test_batch_pose['motion_repr_clean'][:, 0:-1]
 
-            if not args.input_noise:
-                if iter_idx == 0:
-                    test_batch_pose['cond'] = test_batch_pose['motion_repr_clean'].clone()  # [bs, clip_len, body_feat_dim]
-                else:
-                    test_batch_pose['cond'] = test_batch_pose['motion_repr_clean'].clone()[:, :, 0].permute(0, 2, 1)  # [bs, clip_len, body_feat_dim]
-            else:
-                if args.iter2_cond_noisy_pose:
-                    test_batch_pose['cond'] = test_batch_pose['motion_repr_noisy'].clone()
-                else:
+            if False:
+                if not args.input_noise:
                     if iter_idx == 0:
+                        test_batch_pose['cond'] = test_batch_pose['motion_repr_clean'].clone()  # [bs, clip_len, body_feat_dim]
+                    else:
+                        test_batch_pose['cond'] = test_batch_pose['motion_repr_clean'].clone()[:, :, 0].permute(0, 2, 1)  # [bs, clip_len, body_feat_dim]
+                else:
+                    if args.iter2_cond_noisy_pose:
                         test_batch_pose['cond'] = test_batch_pose['motion_repr_noisy'].clone()
                     else:
-                        test_batch_pose['cond'] = val_output_pose[:, :, 0].permute(0, 2, 1)  # [bs, clip_len, body_feat_dim]
+                        if iter_idx == 0:
+                            test_batch_pose['cond'] = test_batch_pose['motion_repr_noisy'].clone()
+                        else:
+                            test_batch_pose['cond'] = val_output_pose[:, :, 0].permute(0, 2, 1)  # [bs, clip_len, body_feat_dim]
+
+            # QUESTION: this replacement only occurs when args.mask_scheme is not 'lower' or args.input_noise, I don't quite grasp why.
             #### replace condition traj with denoised output from traj network
-            if not (args.mask_scheme == 'lower' and not args.input_noise):
-                test_batch_pose['cond'][:, :, 0:22] = traj_rec_full
+            # if not (args.mask_scheme == 'lower' and not args.input_noise):
+            #     test_batch_pose['cond'][:, :, 0:22] = traj_rec_full
+
+            test_batch_pose['cond'][:, :, :test_traj_dataset.traj_feat_dim] = val_output_traj
+
             bs, clip_len = test_batch_pose['motion_repr_clean'].shape[0], test_batch_pose['motion_repr_clean'].shape[1]
 
-            ######### apply occlusion masks
-            mask_iter_num = args.sample_iter if args.iter2_cond_noisy_pose else 1  # for iter inference>0, do not use occlusion mask if iter2_cond_noisy_pose=False
-            if iter_idx < mask_iter_num:
-                ######################## mask out lower body part
-                if args.mask_scheme == 'lower':
-                    mask_joint_id = np.asarray([1, 2, 4, 5, 7, 8, 10, 11])
-                    for k in range(3):
-                        test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + mask_joint_id * 3 + k] = 0.
-                    for k in range(3):
-                        test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + 22 * 3 + mask_joint_id * 3 + k] = 0.
-                    for k in range(6):
-                        test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + 22 * 3 + 22 * 3 + (mask_joint_id - 1) * 6 + k] = 0.
-                    test_batch_pose['cond'][:, :, -4:] = 0.
-                ######################## mask out upper body part
-                if args.mask_scheme == 'upper':
-                    mask_joint_id = np.asarray([3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20])
-                    for k in range(3):
-                        test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + mask_joint_id * 3 + k] = 0.
-                    for k in range(3):
-                        test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + 22 * 3 + mask_joint_id * 3 + k] = 0.
-                    for k in range(6):
-                        test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + 22 * 3 + 22 * 3 + (mask_joint_id - 1) * 6 + k] = 0.
-                    test_batch_pose['cond'][:, :, -4:] = 0.
-                ######################## mask out full body pose (excluding traj) for some frames
-                if args.mask_scheme == 'full':
-                    if not args.infill_traj:
-                        start = torch.FloatTensor(bs).uniform_(0, clip_len - 1).long()  # [bs]
-                        mask_len = 30
-                        end = start + mask_len
-                        end[end > clip_len] = clip_len
-                    test_batch_pose['cond'][:, :, -4:] = 0.
-                    for idx in range(bs):
-                        test_batch_pose['cond'][idx, start[idx]:end[idx], 22:] = 0
+            if False:
+                ######### apply occlusion masks
+                mask_iter_num = args.sample_iter if args.iter2_cond_noisy_pose else 1  # for iter inference>0, do not use occlusion mask if iter2_cond_noisy_pose=False
+                if iter_idx < mask_iter_num:
+                    ######################## mask out lower body part
+                    if args.mask_scheme == 'lower':
+                        mask_joint_id = np.asarray([1, 2, 4, 5, 7, 8, 10, 11])
+                        for k in range(3):
+                            test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + mask_joint_id * 3 + k] = 0.
+                        for k in range(3):
+                            test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + 22 * 3 + mask_joint_id * 3 + k] = 0.
+                        for k in range(6):
+                            test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + 22 * 3 + 22 * 3 + (mask_joint_id - 1) * 6 + k] = 0.
+                        test_batch_pose['cond'][:, :, -4:] = 0.
+                    ######################## mask out upper body part
+                    if args.mask_scheme == 'upper':
+                        mask_joint_id = np.asarray([3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20])
+                        for k in range(3):
+                            test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + mask_joint_id * 3 + k] = 0.
+                        for k in range(3):
+                            test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + 22 * 3 + mask_joint_id * 3 + k] = 0.
+                        for k in range(6):
+                            test_batch_pose['cond'][:, :, test_pose_dataset.traj_feat_dim + 22 * 3 + 22 * 3 + (mask_joint_id - 1) * 6 + k] = 0.
+                        test_batch_pose['cond'][:, :, -4:] = 0.
+                    ######################## mask out full body pose (excluding traj) for some frames
+                    if args.mask_scheme == 'full':
+                        if not args.infill_traj:
+                            start = torch.FloatTensor(bs).uniform_(0, clip_len - 1).long()  # [bs]
+                            mask_len = 30
+                            end = start + mask_len
+                            end[end > clip_len] = clip_len
+                        test_batch_pose['cond'][:, :, -4:] = 0.
+                        for idx in range(bs):
+                            test_batch_pose['cond'][idx, start[idx]:end[idx], 22:] = 0
 
             test_batch_pose['cond'] = torch.permute(test_batch_pose['cond'], (0, 2, 1)).unsqueeze(-2)
             if iter_idx == 0:
@@ -388,7 +363,7 @@ def main(args):
         motion_repr_rec = val_output_pose[:, :, 0].permute(0, 2, 1).detach().cpu().numpy()  # [bs, clip_len, body_feat_dim]
         if args.input_noise:
             motion_repr_noisy = test_batch_pose['motion_repr_noisy'].detach().cpu().numpy()
-            motion_repr_noisy[:, :, 0:22] = traj_noisy_full[:, 0:-1, :]
+            motion_repr_noisy[:, :, :test_traj_dataset.traj_feat_dim] = traj_noisy_full[:, 0:-1, :]
 
         motion_repr_clean = motion_repr_clean * test_pose_dataset.Std + test_pose_dataset.Mean
         motion_repr_rec = motion_repr_rec * test_pose_dataset.Std + test_pose_dataset.Mean
@@ -399,7 +374,7 @@ def main(args):
         ###### clean motion
         cur_total_dim = 0
         repr_dict_clean = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_pose_dataset.repr_list:
             repr_dict_clean[repr_name] = motion_repr_clean[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_clean[repr_name] = torch.from_numpy(repr_dict_clean[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -409,7 +384,7 @@ def main(args):
         ###### rec motion from abs traj / smpl params
         cur_total_dim = 0
         repr_dict_rec = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_pose_dataset.repr_list:
             repr_dict_rec[repr_name] = motion_repr_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_rec[repr_name] = torch.from_numpy(repr_dict_rec[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -421,7 +396,7 @@ def main(args):
         if args.input_noise:
             cur_total_dim = 0
             repr_dict_noisy = {}
-            for repr_name in REPR_LIST:
+            for repr_name in test_pose_dataset.repr_list:
                 repr_dict_noisy[repr_name] = motion_repr_noisy[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
                 repr_dict_noisy[repr_name] = torch.from_numpy(repr_dict_noisy[repr_name]).to(dist_util.dev())
                 cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -442,7 +417,7 @@ def main(args):
 
         save_data = {}
         save_data['mask_scheme'] = args.mask_scheme
-        save_data['repr_name_list'] = REPR_LIST
+        save_data['repr_name_list'] = test_traj_dataset.repr_list
         save_data['repr_dim_dict'] = REPR_DIM_DICT
         save_data['rec_ric_data_clean_list'] = np.concatenate(rec_ric_data_clean_list, axis=0)
         if args.input_noise:

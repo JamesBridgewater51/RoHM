@@ -286,40 +286,36 @@ class TrajNet(nn.Module):
         loss_dict = {}
 
         ###################### loss on full motion repr
-        if not self.repr_abs_only:
-            full_repr_rec = torch.cat([model_output, batch['motion_repr_clean'][:, :, self.traj_feat_dim:]], dim=-1)
-        else:
-            full_repr_rec = batch['motion_repr_clean'].clone()
-            full_repr_rec[..., 0] = model_output[..., 0]
-            full_repr_rec[..., 2:4] = model_output[..., 1:3]
-            full_repr_rec[..., 6] = model_output[..., 3]
-            full_repr_rec[..., 7:13] = model_output[..., 4:10]
-            full_repr_rec[..., 16:19] = model_output[..., 10:13]
+        full_repr_rec = torch.cat([model_output, batch['motion_repr_clean'][:, :, self.traj_feat_dim:]], dim=-1)
         loss_rec_traj_repr_all = self.mse_loss(batch['motion_repr_clean'], full_repr_rec)  # [bs, clip_len, xxx]
 
         ###################### loss on traj repr
-        loss_dict['loss_repr_traj_root_rot_angle'] = loss_rec_traj_repr_all[:, :, 0].mean()
-        loss_dict['loss_repr_traj_root_l_pos'] = loss_rec_traj_repr_all[:, :, 2:4].mean()
-        loss_dict['loss_repr_traj_root_height'] = loss_rec_traj_repr_all[:, :, 6].mean()
-        loss_dict['loss_repr_traj_smplx_rot_6d'] = loss_rec_traj_repr_all[:, :, 7:13].mean()
-        loss_dict['loss_repr_traj_smplx_trans'] = loss_rec_traj_repr_all[:, :, 16:19].mean()
-        if not self.repr_abs_only:
+        if self.repr_abs_only:
+            loss_dict['loss_repr_traj_root_rot_angle'] = loss_rec_traj_repr_all[:, :, 0].mean()
+            loss_dict['loss_repr_traj_root_l_pos'] = loss_rec_traj_repr_all[:, :, 1:3].mean()
+            loss_dict['loss_repr_traj_root_height'] = loss_rec_traj_repr_all[:, :, 3].mean()
+            loss_dict['loss_repr_traj_smplx_rot_6d'] = loss_rec_traj_repr_all[:, :, 4:10].mean()
+            loss_dict['loss_repr_traj_smplx_trans'] = loss_rec_traj_repr_all[:, :, 10:13].mean()
+        else:
+            loss_dict['loss_repr_traj_root_rot_angle'] = loss_rec_traj_repr_all[:, :, 0].mean()
+            loss_dict['loss_repr_traj_root_l_pos'] = loss_rec_traj_repr_all[:, :, 2:4].mean()
+            loss_dict['loss_repr_traj_root_height'] = loss_rec_traj_repr_all[:, :, 6].mean()
+            loss_dict['loss_repr_traj_smplx_rot_6d'] = loss_rec_traj_repr_all[:, :, 7:13].mean()
+            loss_dict['loss_repr_traj_smplx_trans'] = loss_rec_traj_repr_all[:, :, 16:19].mean()
+
             loss_dict['loss_repr_traj_root_rot_angle_vel'] = loss_rec_traj_repr_all[:, :, 1].mean()
             loss_dict['loss_repr_traj_root_l_vel'] = loss_rec_traj_repr_all[:, :, 4:6].mean()
             loss_dict['loss_repr_traj_smplx_rot_vel'] = loss_rec_traj_repr_all[:, :, 13:16].mean()
             loss_dict['loss_repr_traj_smplx_trans_vel'] = loss_rec_traj_repr_all[:, :, 19:22].mean()
-            loss_dict['loss_repr_traj'] = loss_rec_traj_repr_all[..., 0:self.traj_feat_dim].mean()
-        else:
-            loss_dict['loss_repr_traj'] = torch.cat([loss_rec_traj_repr_all[..., 0:1], loss_rec_traj_repr_all[..., 2:4],
-                                                     loss_rec_traj_repr_all[..., 6:7], loss_rec_traj_repr_all[..., 7:13],
-                                                     loss_rec_traj_repr_all[..., 16:19]], dim=-1).mean()
+
+        loss_dict['loss_repr_traj'] = loss_rec_traj_repr_all[..., 0:self.traj_feat_dim].mean()
 
         ###################### loss on pelvis (root) joint location
         full_repr_clean = batch['motion_repr_clean'] * torch.from_numpy(self.dataset.Std).to(self.device) + torch.from_numpy(self.dataset.Mean).to(self.device)
         # reconstruct joint positions
         cur_total_dim = 0
         repr_dict_clean = {}
-        for repr_name in REPR_LIST:
+        for repr_name in self.dataset.repr_list:
             repr_dict_clean[repr_name] = full_repr_clean[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             cur_total_dim += REPR_DIM_DICT[repr_name]
         joint_pos_clean = recover_from_repr_smpl(repr_dict_clean, recover_mode='joint_abs_traj', smplx_model=smplx_model)
@@ -329,50 +325,64 @@ class TrajNet(nn.Module):
         # reconstruct joint positions
         cur_total_dim = 0
         repr_dict_rec = {}
-        for repr_name in REPR_LIST:
+        for repr_name in self.dataset.repr_list:
             repr_dict_rec[repr_name] = full_repr_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             cur_total_dim += REPR_DIM_DICT[repr_name]
         ### reconstruct joint positions from: absolute traj repr (joint-based), relative traj repr (joint-based), and smplx-based repr
         # Note: relative traj repr (joint-based) in repr_dict_rec is actually ground truth if self.repr_abs_only=True, and corresponding loss will be 0
         joint_pos_rec_from_abs_traj = recover_from_repr_smpl(repr_dict_rec, recover_mode='joint_abs_traj', smplx_model=smplx_model)  # [bs, clip_len, 22, 3]
-        joint_pos_rec_from_rel_traj = recover_from_repr_smpl(repr_dict_rec, recover_mode='joint_rel_traj', smplx_model=smplx_model)
         joint_pos_rec_from_smpl = recover_from_repr_smpl(repr_dict_rec, recover_mode='smplx_params', smplx_model=smplx_model)
         root_pos_rec_from_abs_traj = joint_pos_rec_from_abs_traj[:, :, 0]
-        root_pos_rec_from_rel_traj = joint_pos_rec_from_rel_traj[:, :, 0]
         root_pos_rec_from_smpl = joint_pos_rec_from_smpl[:, :, 0]
+        if not self.repr_abs_only:
+            joint_pos_rec_from_rel_traj = recover_from_repr_smpl(repr_dict_rec, recover_mode='joint_rel_traj', smplx_model=smplx_model)
+            root_pos_rec_from_rel_traj = joint_pos_rec_from_rel_traj[:, :, 0]
 
         loss_dict['loss_root_pos_global_from_abs_traj'] = self.mse_loss(root_pos_rec_from_abs_traj, root_pos_clean).mean()
-        loss_dict['loss_root_pos_global_from_rel_traj'] = self.mse_loss(root_pos_rec_from_rel_traj, root_pos_clean).mean()
         loss_dict['loss_root_pos_global_from_smpl'] = self.mse_loss(root_pos_rec_from_smpl, root_pos_clean).mean()
+        if not self.repr_abs_only:
+            loss_dict['loss_root_pos_global_from_rel_traj'] = self.mse_loss(root_pos_rec_from_rel_traj, root_pos_clean).mean()
+        else:
+            loss_dict['loss_root_pos_global_from_rel_traj'] = torch.tensor(0.0).to(self.device)
 
         ###################### loss on pelvis (root) joint velocity
         root_vel_clean = root_pos_clean[:, 1:] - root_pos_clean[:, 0:-1]
         root_vel_rec_from_abs_traj = root_pos_rec_from_abs_traj[:, 1:] - root_pos_rec_from_abs_traj[:, 0:-1]
-        root_vel_rec_from_rel_traj = root_pos_rec_from_rel_traj[:, 1:] - root_pos_rec_from_rel_traj[:, 0:-1]
         root_vel_rec_from_smpl = root_pos_rec_from_smpl[:, 1:] - root_pos_rec_from_smpl[:, 0:-1]
         loss_dict['loss_root_vel_global_from_abs_traj'] = self.mse_loss(root_vel_rec_from_abs_traj, root_vel_clean).mean()
-        loss_dict['loss_root_vel_global_from_rel_traj'] = self.mse_loss(root_vel_rec_from_rel_traj, root_vel_clean).mean()
         loss_dict['loss_root_vel_global_from_smpl'] = self.mse_loss(root_vel_rec_from_smpl, root_vel_clean).mean()
+        if not self.repr_abs_only:
+            root_vel_rec_from_rel_traj = root_pos_rec_from_rel_traj[:, 1:] - root_pos_rec_from_rel_traj[:, 0:-1]
+            loss_dict['loss_root_vel_global_from_rel_traj'] = self.mse_loss(root_vel_rec_from_rel_traj, root_vel_clean).mean()
+        else:
+            loss_dict['loss_root_vel_global_from_rel_traj'] = torch.tensor(0.0).to(self.device)
 
         ###################### loss on smplx global_orient angular velocity
-        bs = joint_pos_clean.shape[0]
-        global_orient_mat = rot6d_to_rotmat(repr_dict_rec['smplx_rot_6d'].reshape(-1, 6))  # [bs*T, 3, 3]
-        global_orient_mat = global_orient_mat.reshape(bs, -1, 3, 3)
-        dRdt = global_orient_mat[:, 1:] - global_orient_mat[:, 0:-1]  # [bs, seq_len-1, 3, 3]
-        smplx_rot_vel = estimate_angular_velocity(global_orient_mat[:, 0:-1], dRdt)  # [bs, 143, 3]
-        loss_dict['loss_root_smplx_rot_vel'] = self.mse_loss(smplx_rot_vel, repr_dict_clean['smplx_rot_vel'][:, 0:-1]).mean()
+        if not self.repr_abs_only:
+            bs = joint_pos_clean.shape[0]
+            global_orient_mat = rot6d_to_rotmat(repr_dict_rec['smplx_rot_6d'].reshape(-1, 6))  # [bs*T, 3, 3]
+            global_orient_mat = global_orient_mat.reshape(bs, -1, 3, 3)
+            dRdt = global_orient_mat[:, 1:] - global_orient_mat[:, 0:-1]  # [bs, seq_len-1, 3, 3]
+            smplx_rot_vel = estimate_angular_velocity(global_orient_mat[:, 0:-1], dRdt)  # [bs, 143, 3]
+            loss_dict['loss_root_smplx_rot_vel'] = self.mse_loss(smplx_rot_vel, repr_dict_clean['smplx_rot_vel'][:, 0:-1]).mean()
 
-        ###################### loss on smplx global transl velocity
-        smplx_transl_vel = repr_dict_rec['smplx_trans'][:, 1:] - repr_dict_rec['smplx_trans'][:, 0:-1]
-        loss_dict['loss_root_smplx_transl_vel'] = self.mse_loss(smplx_transl_vel, repr_dict_clean['smplx_trans_vel'][:, 0:-1]).mean()
+            ###################### loss on smplx global transl velocity
+            smplx_transl_vel = repr_dict_rec['smplx_trans'][:, 1:] - repr_dict_rec['smplx_trans'][:, 0:-1]
+            loss_dict['loss_root_smplx_transl_vel'] = self.mse_loss(smplx_transl_vel, repr_dict_clean['smplx_trans_vel'][:, 0:-1]).mean()
+        else:
+            loss_dict['loss_root_smplx_rot_vel'] = torch.tensor(0.0).to(self.device)
+            loss_dict['loss_root_smplx_transl_vel'] = torch.tensor(0.0).to(self.device)
 
         ###################### pelvis position translational smoothness loss
         root_acc_rec_from_abs_traj = root_vel_rec_from_abs_traj[:, 1:] - root_vel_rec_from_abs_traj[:, 0:-1]
-        root_acc_rec_from_rel_traj = root_vel_rec_from_rel_traj[:, 1:] - root_vel_rec_from_rel_traj[:, 0:-1]
         root_acc_rec_from_smpl = root_vel_rec_from_smpl[:, 1:] - root_vel_rec_from_smpl[:, 0:-1]
         loss_dict['loss_root_smooth_from_abs_traj'] = torch.mean(root_acc_rec_from_abs_traj ** 2)
-        loss_dict['loss_root_smooth_from_rel_traj'] = torch.mean(root_acc_rec_from_rel_traj ** 2)
         loss_dict['loss_root_smooth_from_smpl'] = torch.mean(root_acc_rec_from_smpl ** 2)
+        if not self.repr_abs_only:
+            root_acc_rec_from_rel_traj = root_vel_rec_from_rel_traj[:, 1:] - root_vel_rec_from_rel_traj[:, 0:-1]
+            loss_dict['loss_root_smooth_from_rel_traj'] = torch.mean(root_acc_rec_from_rel_traj ** 2)
+        else:
+            loss_dict['loss_root_smooth_from_rel_traj'] = torch.tensor(0.0).to(self.device)
 
         ###################### pelvis rotation velocity and smoothness loss
         # compute on cosine values: continuous, no jump
@@ -382,12 +392,6 @@ class TrajNet(nn.Module):
 
         root_rot_cos_acc_rec = root_rot_cos_vel_rec[:, 1:] - root_rot_cos_vel_rec[:, 0:-1]
         loss_dict['loss_root_rot_cos_smooth_from_abs_traj'] = torch.mean(root_rot_cos_acc_rec ** 2)
-
-        if self.repr_abs_only:
-            loss_dict['loss_root_pos_global_from_rel_traj'] = torch.tensor(0.0).to(self.device)
-            loss_dict['loss_root_vel_global_from_rel_traj'] = torch.tensor(0.0).to(self.device)
-            loss_dict['loss_root_smooth_from_rel_traj'] = torch.tensor(0.0).to(self.device)
-
 
         loss_dict["loss"] = self.weight_loss_root_rec_repr * loss_dict['loss_repr_traj'] + \
                             self.weight_loss_root_pos_global * (loss_dict['loss_root_pos_global_from_abs_traj'] + loss_dict['loss_root_pos_global_from_rel_traj'] + loss_dict['loss_root_pos_global_from_smpl']) + \

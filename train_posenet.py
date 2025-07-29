@@ -20,6 +20,7 @@ group = configargparse.ArgParser(formatter_class=arg_formatter,
                                       prog='')
 group.add_argument('--config', is_config_file=True, default='', help='config file path')
 group.add_argument("--device", default=0, type=int, help="Device id to use.")
+group.add_argument('--run_name', type=str, default='baselines/RoHM', help='path to datas')
 # group.add_argument("--seed", default=0, type=int, help="For fixing random seed.")
 
 ######################## diffusion setups
@@ -35,6 +36,7 @@ group.add_argument('--dataset_root', type=str, default='/mnt/hdd/diffusion_mocap
 ####################### model setups
 group.add_argument('--task', default='pose', type=str, choices=['traj', 'pose'])
 group.add_argument("--clip_len", default=145, type=int, help="sequence length for each clip")
+group.add_argument('--repr_abs_only', default='True', type=lambda x: x.lower() in ['true', '1'], help='if True, only include absolute trajectory repr')
 ### load pretrained checkpoints
 group.add_argument('--load_pretrained_model', default='False', type=lambda x: x.lower() in ['true', '1'], help='if load pretrained checkpoint')
 group.add_argument('--pretrained_model_path', type=str, default='', help='')
@@ -59,8 +61,8 @@ group.add_argument("--weight_loss_foot_skating", default=0.0, type=float)  # 0.1
 group.add_argument("--batch_size", default=32, type=int, help="Batch size during training.")
 group.add_argument('--debug', default='False', type=lambda x: x.lower() in ['true', '1'], help='')
 group.add_argument("--start_prox_mask_epoch", default=500, type=int, help="which epoch to start to apply prox masks")
-group.add_argument("--mask_scheme", default='lower', type=str,
-                   choices=['lower', 'lower+upper', 'lower+full', 'lower+upper+full'])
+group.add_argument("--mask_scheme", default='upper_body', type=str,
+                   choices=['head_only', 'lower_body', 'upper_body', 'head_with_two_hands', 'head_with_two_hands_and_two_feets'])
 group.add_argument("--save_dir", default='runs', type=str, help="Path to save checkpoints and results.")
 group.add_argument("--lr", default=1e-4, type=float, help="Learning rate.")
 group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
@@ -84,7 +86,7 @@ def main(args, writer, logdir, logger):
     train_dataset = DataloaderAMASS(preprocessed_amass_root=args.dataset_root, split='train',
                                     amass_datasets=amass_train_datasets,
                                     body_model_path=args.body_model_path,
-                                    repr_abs_only=False,
+                                    repr_abs_only=args.repr_abs_only,
                                     input_noise=args.input_noise,
                                     noise_std_smplx_global_rot=args.noise_std_smplx_global_rot,
                                     noise_std_smplx_body_rot=args.noise_std_smplx_body_rot,
@@ -99,7 +101,7 @@ def main(args, writer, logdir, logger):
     test_dataset = DataloaderAMASS(preprocessed_amass_root=args.dataset_root, split='test', spacing=2,
                                    amass_datasets=amass_test_datasets,
                                    body_model_path=args.body_model_path,
-                                   repr_abs_only=False,
+                                   repr_abs_only=args.repr_abs_only,
                                    input_noise=args.input_noise,
                                    noise_std_smplx_global_rot=args.noise_std_smplx_global_rot,
                                    noise_std_smplx_body_rot=args.noise_std_smplx_body_rot,
@@ -113,7 +115,8 @@ def main(args, writer, logdir, logger):
 
 
     print("creating model and diffusion...")
-    model = PoseNet(dataset=train_dataset, body_feat_dim=train_dataset.body_feat_dim,
+    pose_cond_dim = 22*3 + train_dataset.traj_feat_dim if args.repr_abs_only else 22*3+22*3+train_dataset.traj_feat_dim
+    model = PoseNet(dataset=train_dataset, cond_feat_dim=pose_cond_dim, body_feat_dim=train_dataset.body_feat_dim,
                     latent_dim=512, ff_size=1024, num_layers=8, num_heads=4, dropout=0.1, activation="gelu",
                     body_model_path=args.body_model_path,
                     device=dist_util.dev(),
@@ -125,6 +128,7 @@ def main(args, writer, logdir, logger):
                     weight_loss_joint_smooth=args.weight_loss_joint_smooth,
                     weight_loss_foot_skating=args.weight_loss_foot_skating,
                     start_skating_loss_epoch=args.start_skating_loss_epoch,
+                    repr_abs_only=args.repr_abs_only,
                     ).to(dist_util.dev())
     if args.load_pretrained_model:
         weights = torch.load(args.pretrained_model_path, map_location=lambda storage, loc: storage)
@@ -155,8 +159,7 @@ def main(args, writer, logdir, logger):
 
 
 if __name__ == "__main__":
-    run_id = random.randint(1, 100000)
-    logdir = os.path.join(args.save_dir, str(run_id))  # create new path
+    logdir = os.path.join(args.save_dir, args.run_name)  
     writer = SummaryWriter(log_dir=logdir)
     print('RUNDIR: {}'.format(logdir))
     sys.stdout.flush()
@@ -164,4 +167,7 @@ if __name__ == "__main__":
     logger = get_logger(logdir)
     logger.info('Let the games begin')  # write in log file
     save_config(logdir, args)
+    from utils.ipdb_safety_net import ipdb_safety_net
+    
+    ipdb_safety_net()
     main(args, writer, logdir, logger)

@@ -65,21 +65,22 @@ class DataloaderVideo(data.Dataset):
                                         'smplx_rot_6d', 'smplx_trans']
         self.local_repr_name_list = ['local_positions', 'local_vel',
                                      'smplx_body_pose_6d', 'smplx_betas', 'foot_contact', ]
+        self.repr_list = self.traj_repr_name_list + self.local_repr_name_list
 
         ## get dimensions for features
         self.body_feat_dim = 0
         self.traj_feat_dim = 0
         self.pose_feat_dim = 0
-        for repr_name in REPR_LIST:
+        for repr_name in self.repr_list:
             self.body_feat_dim += REPR_DIM_DICT[repr_name]
             if repr_name in self.traj_repr_name_list:
                 self.traj_feat_dim += REPR_DIM_DICT[repr_name]
             if repr_name in self.local_repr_name_list:
                 self.pose_feat_dim += REPR_DIM_DICT[repr_name]
 
-        self.repr_list_input_dict = {}
-        for repr_name in REPR_LIST:
-            self.repr_list_input_dict[repr_name] = []
+        self.self.repr_list_input_dict = {}
+        for repr_name in self.repr_list:
+            self.self.repr_list_input_dict[repr_name] = []
 
         self.cano_smplx_params_dict_list = []
         self.cano_joints_input_list = []
@@ -399,13 +400,13 @@ class DataloaderVideo(data.Dataset):
             self.cano_smplx_params_dict_list.append(cano_smplx_params_dict)
             self.transf_matrix_list.append(transf_matrix)
             self.cano_joints_input_list.append(cano_positions)
-            for repr_name in REPR_LIST:
-                self.repr_list_input_dict[repr_name].append(repr_dict[repr_name])
+            for repr_name in self.repr_list:
+                self.self.repr_list_input_dict[repr_name].append(repr_dict[repr_name])
 
         #######################################  get mean/std from training dataset
         save_dir = self.logdir
-        for repr_name in REPR_LIST:
-            self.repr_list_input_dict[repr_name] = np.asarray(self.repr_list_input_dict[repr_name])  # each item: [N, T-1, d]
+        for repr_name in self.repr_list:
+            self.self.repr_list_input_dict[repr_name] = np.asarray(self.self.repr_list_input_dict[repr_name])  # each item: [N, T-1, d]
         with open(os.path.join(save_dir, 'AMASS_mean.pkl'), 'rb') as f:
             self.Mean_dict = pkl.load(f)
         with open(os.path.join(save_dir, 'AMASS_std.pkl'), 'rb') as f:
@@ -420,11 +421,11 @@ class DataloaderVideo(data.Dataset):
 
     def __getitem__(self, index):
         repr_dict = {}
-        for repr_name in REPR_LIST:
-            repr_dict[repr_name] = self.repr_list_input_dict[repr_name][index]  # [clip_len, d]
+        for repr_name in self.repr_list:
+            repr_dict[repr_name] = self.self.repr_list_input_dict[repr_name][index]  # [clip_len, d]
 
         item_dict = {}
-        item_dict['motion_repr_noisy'] = np.concatenate([repr_dict[key] for key in REPR_LIST], axis=-1)  # [clip_len-1, body_feat_dim]
+        item_dict['motion_repr_noisy'] = np.concatenate([repr_dict[key] for key in self.repr_list], axis=-1)  # [clip_len-1, body_feat_dim]
         item_dict['motion_repr_noisy'] = ((item_dict['motion_repr_noisy'] - self.Mean) / self.Std).astype(np.float32)
         item_dict['noisy_joints'] = self.cano_joints_input_list[index].astype(np.float32)  # in canonicalized coord
         item_dict['noisy_joints_scene_coord'] = self.joints_clip_world_list[index].astype(np.float32)  # [clip_len, 22, 3] in scene coord
@@ -466,7 +467,7 @@ class DataloaderVideo(data.Dataset):
 
         clip_len = len(mask_joint_vis)
         mask_vec_vis = {}
-        for key in REPR_LIST:
+        for key in self.repr_list:
             if key in ['root_rot_angle', 'root_rot_angle_vel', 'root_l_pos', 'root_l_vel', 'root_height',
                        'smplx_rot_6d', 'smplx_rot_vel', 'smplx_trans', 'smplx_trans_vel', 'smplx_betas']:
                 mask_vec_vis[key] = np.ones((clip_len, REPR_DIM_DICT[key]))

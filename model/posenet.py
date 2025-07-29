@@ -9,7 +9,7 @@ from model.heads import *
 
 
 class PoseNet(nn.Module):
-    def __init__(self, dataset, body_feat_dim, nfeats=1,
+    def __init__(self, dataset, cond_feat_dim, body_feat_dim, nfeats=1,
                  latent_dim=256, ff_size=1024, num_layers=8, num_heads=4, dropout=0.1, activation="gelu",
                  body_model_path='',
                  device=None,
@@ -20,10 +20,12 @@ class PoseNet(nn.Module):
                  weight_loss_joint_vel_global=0.0, weight_loss_joint_smooth=0.0,
                  weight_loss_foot_skating=0.0,
                  start_skating_loss_epoch=0,
+                 repr_abs_only:bool=False,
                  ):
         super().__init__()
         self.dataset = dataset
         self.body_feat_dim = body_feat_dim
+        self.cond_feat_dim = cond_feat_dim
         self.nfeats = nfeats  # 1
         self.traj_feat_dim = traj_feat_dim
 
@@ -39,6 +41,7 @@ class PoseNet(nn.Module):
         self.dropout = dropout  # 0.1
         self.activation = activation
         self.input_feats = self.body_feat_dim * self.nfeats
+        self.cond_feats = self.cond_feat_dim * self.nfeats
         self.normalize_output = False
 
         self.mse_loss = nn.MSELoss(reduction='none').to(device)
@@ -53,11 +56,12 @@ class PoseNet(nn.Module):
         self.weight_loss_joint_smooth = weight_loss_joint_smooth
         self.weight_loss_foot_skating = weight_loss_foot_skating
         self.start_skating_loss_epoch = start_skating_loss_epoch
+        self.repr_abs_only=repr_abs_only
 
         self.smplx_model = smplx.create(model_path=body_model_path, model_type="smplx",
                                  gender='neutral', flat_hand_mean=True, use_pca=False).to(self.device)
         self.input_process = InputProcess(self.input_feats, self.latent_dim)
-        self.input_process_cond = InputProcess(self.input_feats, self.latent_dim)
+        self.input_process_cond = InputProcess(self.cond_feats, self.latent_dim)
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
         print("TRANS_ENC init")
         seqTransEncoderLayer = nn.TransformerEncoderLayer(d_model=self.latent_dim,
@@ -100,6 +104,7 @@ class PoseNet(nn.Module):
         # model_output: [bs, pose_feat_dim, 1, T]
         loss_dict = {}
 
+        ds_Std, ds_Mean = torch.from_numpy(self.dataset.Std).to(self.device), torch.from_numpy(self.dataset.Mean).to(self.device)
         ###################### loss on full body repr
         loss_rec_repr_all = self.mse_loss(batch['motion_repr_clean'], model_output)
         loss_rec_repr_all = loss_rec_repr_all[:, :, 0].permute(0, 2, 1)  # [bs, T, 263]
@@ -107,46 +112,55 @@ class PoseNet(nn.Module):
 
         ###################### loss on global joint coordinate
         full_repr_clean = batch['motion_repr_clean'][:, :, 0].permute(0, 2, 1)  # [bs, T, 263]
-        full_repr_clean = full_repr_clean * torch.from_numpy(self.dataset.Std).to(self.device) + torch.from_numpy(self.dataset.Mean).to(self.device)
+        full_repr_clean = full_repr_clean * ds_Std + ds_Mean.to(self.device)
         # reconstruct joint positions
         cur_total_dim = 0
         repr_dict_clean = {}
-        for repr_name in REPR_LIST:
+        for repr_name in self.dataset.repr_list:
             repr_dict_clean[repr_name] = full_repr_clean[..., cur_total_dim:(cur_total_dim+REPR_DIM_DICT[repr_name])]
             cur_total_dim += REPR_DIM_DICT[repr_name]
         joint_pos_clean = recover_from_repr_smpl(repr_dict_clean, recover_mode='joint_abs_traj', smplx_model=smplx_model)
 
         full_repr_rec = model_output[:, :, 0].permute(0, 2, 1)  # [bs, T, 263]
-        full_repr_rec = full_repr_rec * torch.from_numpy(self.dataset.Std).to(self.device) + torch.from_numpy(self.dataset.Mean).to(self.device)
+        full_repr_rec = full_repr_rec * ds_Std.to(self.device) + ds_Mean.to(self.device)
         # reconstruct joint positions
         cur_total_dim = 0
         repr_dict_rec = {}
-        for repr_name in REPR_LIST:
+        for repr_name in self.dataset.repr_list:
             repr_dict_rec[repr_name] = full_repr_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             cur_total_dim += REPR_DIM_DICT[repr_name]
         joint_pos_rec_from_abs_traj = recover_from_repr_smpl(repr_dict_rec, recover_mode='joint_abs_traj', smplx_model=smplx_model)  # [bs, clip_len, 22, 3]
-        joint_pos_rec_from_rel_traj = recover_from_repr_smpl(repr_dict_rec, recover_mode='joint_rel_traj', smplx_model=smplx_model)
         joint_pos_rec_from_smpl = recover_from_repr_smpl(repr_dict_rec, recover_mode='smplx_params', smplx_model=smplx_model)
         loss_dict['loss_joint_pos_global_from_abs_traj'] = self.mse_loss(joint_pos_rec_from_abs_traj, joint_pos_clean).mean()
-        loss_dict['loss_joint_pos_global_from_rel_traj'] = self.mse_loss(joint_pos_rec_from_rel_traj, joint_pos_clean).mean()
         loss_dict['loss_joint_pos_global_from_smpl'] = self.mse_loss(joint_pos_rec_from_smpl, joint_pos_clean).mean()
+        if not self.repr_abs_only:
+            joint_pos_rec_from_rel_traj = recover_from_repr_smpl(repr_dict_rec, recover_mode='joint_rel_traj', smplx_model=smplx_model)
+            loss_dict['loss_joint_pos_global_from_rel_traj'] = self.mse_loss(joint_pos_rec_from_rel_traj, joint_pos_clean).mean()
+        else:
+            loss_dict['loss_joint_pos_global_from_rel_traj'] = torch.tensor(0.0).to(self.device)
 
         ###################### loss on global joint velocity
         joint_vel_clean = joint_pos_clean[:, 1:] - joint_pos_clean[:, 0:-1]
         joint_vel_rec_from_abs_traj = joint_pos_rec_from_abs_traj[:, 1:] - joint_pos_rec_from_abs_traj[:, 0:-1]  # [bs, clip_len-1, 22, 3]
-        joint_vel_rec_from_rel_traj = joint_pos_rec_from_rel_traj[:, 1:] - joint_pos_rec_from_rel_traj[:, 0:-1]
         joint_vel_rec_from_smpl = joint_pos_rec_from_smpl[:, 1:] - joint_pos_rec_from_smpl[:, 0:-1]
         loss_dict['loss_joint_vel_global_from_abs_traj'] = self.mse_loss(joint_vel_rec_from_abs_traj, joint_vel_clean).mean()
-        loss_dict['loss_joint_vel_global_from_rel_traj'] = self.mse_loss(joint_vel_rec_from_rel_traj, joint_vel_clean).mean()
         loss_dict['loss_joint_vel_global_from_smpl'] = self.mse_loss(joint_vel_rec_from_smpl, joint_vel_clean).mean()
+        if not self.repr_abs_only:
+            joint_vel_rec_from_rel_traj = joint_pos_rec_from_rel_traj[:, 1:] - joint_pos_rec_from_rel_traj[:, 0:-1]
+            loss_dict['loss_joint_vel_global_from_rel_traj'] = self.mse_loss(joint_vel_rec_from_rel_traj, joint_vel_clean).mean()
+        else:
+            loss_dict['loss_joint_vel_global_from_rel_traj'] = torch.tensor(0.0).to(self.device)
 
         ###################### accel smooth regularizor
         joint_acc_rec_from_abs_traj = joint_vel_rec_from_abs_traj[:, 1:] - joint_vel_rec_from_abs_traj[:, 0:-1]
-        joint_acc_rec_from_rel_traj = joint_vel_rec_from_rel_traj[:, 1:] - joint_vel_rec_from_rel_traj[:, 0:-1]
         joint_acc_rec_from_smpl = joint_vel_rec_from_smpl[:, 1:] - joint_vel_rec_from_smpl[:, 0:-1]
         loss_dict['loss_joint_smooth_from_abs_traj'] = torch.mean(joint_acc_rec_from_abs_traj ** 2)
-        loss_dict['loss_joint_smooth_from_rel_traj'] = torch.mean(joint_acc_rec_from_rel_traj ** 2)
         loss_dict['loss_joint_smooth_from_smpl'] = torch.mean(joint_acc_rec_from_smpl ** 2)
+        if not self.repr_abs_only:
+            joint_acc_rec_from_rel_traj = joint_vel_rec_from_rel_traj[:, 1:] - joint_vel_rec_from_rel_traj[:, 0:-1]
+            loss_dict['loss_joint_smooth_from_rel_traj'] = torch.mean(joint_acc_rec_from_rel_traj ** 2)
+        else:
+            loss_dict['loss_joint_smooth_from_rel_traj'] = torch.tensor(0.0).to(self.device)
 
         ###################### contact lbl loss
         loss_dict['loss_repr_foot_contact_mse'] = self.mse_loss(batch['motion_repr_clean'][:, -4:, :, :], model_output[:, -4:, :, :]).mean()
@@ -162,13 +176,16 @@ class PoseNet(nn.Module):
         masked_foot_joint_rec_vel_from_abs_traj = foot_joint_rec_vel_from_abs_traj * mask_skating_from_abs_traj  # [bs, clip_len-1, 4]
         loss_dict['loss_foot_skating_from_abs_traj'] = masked_foot_joint_rec_vel_from_abs_traj.sum() / mask_skating_from_abs_traj.sum()
 
-        foot_joint_rec_vel_from_rel_traj = (joint_pos_rec_from_rel_traj[:, 1:, self.foot_joint_index_list] -
-                                            joint_pos_rec_from_rel_traj[:, 0:-1, self.foot_joint_index_list]) * self.fps
-        foot_joint_rec_vel_from_rel_traj = torch.norm(foot_joint_rec_vel_from_rel_traj, dim=-1)
-        mask_skating_from_rel_traj = (foot_joint_rec_vel_from_rel_traj - self.foot_skating_vel_thres).gt(0)
-        mask_skating_from_rel_traj = mask_skating_from_rel_traj * contact_lbl_gt[:, 0:-1]
-        masked_foot_joint_rec_vel_from_rel_traj = foot_joint_rec_vel_from_rel_traj * mask_skating_from_rel_traj
-        loss_dict['loss_foot_skating_from_rel_traj'] = masked_foot_joint_rec_vel_from_rel_traj.sum() / mask_skating_from_rel_traj.sum()
+        if not self.repr_abs_only:
+            foot_joint_rec_vel_from_rel_traj = (joint_pos_rec_from_rel_traj[:, 1:, self.foot_joint_index_list] -
+                                                joint_pos_rec_from_rel_traj[:, 0:-1, self.foot_joint_index_list]) * self.fps
+            foot_joint_rec_vel_from_rel_traj = torch.norm(foot_joint_rec_vel_from_rel_traj, dim=-1)
+            mask_skating_from_rel_traj = (foot_joint_rec_vel_from_rel_traj - self.foot_skating_vel_thres).gt(0)
+            mask_skating_from_rel_traj = mask_skating_from_rel_traj * contact_lbl_gt[:, 0:-1]
+            masked_foot_joint_rec_vel_from_rel_traj = foot_joint_rec_vel_from_rel_traj * mask_skating_from_rel_traj
+            loss_dict['loss_foot_skating_from_rel_traj'] = masked_foot_joint_rec_vel_from_rel_traj.sum() / mask_skating_from_rel_traj.sum()
+        else:
+            loss_dict['loss_foot_skating_from_rel_traj'] = torch.tensor(0.0).to(self.device)
 
         foot_joint_rec_vel_from_smpl = (joint_pos_rec_from_smpl[:, 1:, self.foot_joint_index_list] -
                                             joint_pos_rec_from_smpl[:, 0:-1, self.foot_joint_index_list]) * self.fps
@@ -202,15 +219,16 @@ class PoseNet(nn.Module):
                 x_t = out['pred_xstart']
             x_t = x_t.detach().requires_grad_()  # [bs, body_feat_dim, 1, T]
 
+            ds_Std, ds_Mean = torch.from_numpy(self.dataset.Std).to(self.device), torch.from_numpy(self.dataset.Mean).to(self.device)
             ########## obtain global joint coordinate
             full_repr_rec = x_t[:, :, 0].permute(0, 2, 1)  # [bs, T, body_feat_dim]
-            full_repr_rec = full_repr_rec * torch.from_numpy(self.dataset.Std).to(self.device) + torch.from_numpy(self.dataset.Mean).to(self.device)
+            full_repr_rec = full_repr_rec * ds_Std.to(self.device) + ds_Mean.to(self.device)
 
             # reconstruct joint positions
             traj_feat_dim = self.dataset.traj_feat_dim
             cur_total_dim = 0
             repr_dict_rec = {}
-            for repr_name in REPR_LIST:
+            for repr_name in self.dataset.repr_list:
                 repr_dict_rec[repr_name] = full_repr_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
                 cur_total_dim += REPR_DIM_DICT[repr_name]
             joint_pos_rec_from_abs_traj = recover_from_repr_smpl(repr_dict_rec, recover_mode='joint_abs_traj', smplx_model=self.smplx_model)  # [bs, clip_len, 22, 3]
@@ -266,15 +284,17 @@ class PoseNet(nn.Module):
                 x_t = out['pred_xstart']
             x_t = x_t.detach().requires_grad_()  # [bs, body_feat_dim, 1, T]
 
+            ds_Std, ds_Mean = torch.from_numpy(self.dataset.Std).to(self.device), torch.from_numpy(self.dataset.Mean).to(self.device)
+
             ########## obtain global joint coordinate
             full_repr_rec = x_t[:, :, 0].permute(0, 2, 1)  # [bs, T, body_feat_dim]
-            full_repr_rec = full_repr_rec * torch.from_numpy(self.dataset.Std).to(self.device) + torch.from_numpy(self.dataset.Mean).to(self.device)
+            full_repr_rec = full_repr_rec * ds_Std.to(self.device) + ds_Mean.to(self.device)
 
             # reconstruct joint positions
             traj_feat_dim = self.dataset.traj_feat_dim
             cur_total_dim = 0
             repr_dict_rec = {}
-            for repr_name in REPR_LIST:
+            for repr_name in self.dataset.repr_list:
                 repr_dict_rec[repr_name] = full_repr_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
                 cur_total_dim += REPR_DIM_DICT[repr_name]
             # joint_pos_rec_from_abs_traj = recover_from_repr_smpl(repr_dict_rec, recover_mode='joint_abs_traj', smplx_model=self.smplx_model)  # [bs, clip_len, 22, 3]

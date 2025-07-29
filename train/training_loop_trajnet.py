@@ -12,16 +12,19 @@ from torch.optim import AdamW
 from utils import dist_util
 from diffusion.fp16_util import MixedPrecisionTrainer
 from diffusion.resample import create_named_schedule_sampler
+from utils.data_util import mask_batch_cond
+from utils.constants import MOCAP_MASK_SCHEME_CHOICES, MOCAP_VIS_MASK_IDS
 
 class TrainLoopTrajNet:
     def __init__(self, args, writer, model, diffusion_train, diffusion_eval, timestep_respacing_eval,
-                 start_infill_epoch, max_infill_ratio, mask_prob, train_dataloader, test_dataloader, logdir, logger, device='cpu'):
+                 start_infill_epoch, max_infill_ratio, mask_prob, train_dataloader, test_dataloader, logdir, logger, mask_scheme, device='cpu'):
         self.writer = writer
         self.model = model
         self.diffusion_train = diffusion_train
         self.diffusion_eval = diffusion_eval
         self.train_dataloader = train_dataloader
         self.test_dataloader = test_dataloader
+        self.args = args
         self.batch_size = args.batch_size
         self.lr = args.lr
         self.log_interval = args.log_interval
@@ -33,6 +36,7 @@ class TrainLoopTrajNet:
         self.start_infill_epoch = start_infill_epoch
         self.mask_prob = mask_prob
         self.max_infill_ratio = max_infill_ratio
+        self.mask_scheme = mask_scheme
 
         self.smplx_neutral = smplx.create(model_path=args.body_model_path, model_type="smplx",
                                           gender='neutral', flat_hand_mean=True, use_pca=False).to(device)
@@ -67,6 +71,7 @@ class TrainLoopTrajNet:
 
                 ######### add occlusion mask for traj repr, with some schedules
                 if epoch >= self.start_infill_epoch:
+                    raise DeprecationWarning("Infilling task is not supported currently.")
                     prob = random.uniform(0, 1)
                     if prob > 1 - self.mask_prob:
                         clip_len = batch['cond'].shape[1]
@@ -80,23 +85,34 @@ class TrainLoopTrajNet:
                             mask_traj[bs, start[bs]:end[bs]] = 0
                         mask_traj = mask_traj.unsqueeze(-1).repeat(1, 1, traj_feat_dim)   # [bs, t, 4]
                         batch['cond'][:, :, 0:traj_feat_dim] = batch['cond'][:, :, 0:traj_feat_dim] * mask_traj
+                
+                mask_joint_ids = set(range(22)) - set(MOCAP_VIS_MASK_IDS[self.mask_scheme])
+                mask_joint_ids = np.asarray(list(mask_joint_ids))
+                batch = mask_batch_cond(batch=batch, task=self.args.task, args=self.args, mask_joint_ids=mask_joint_ids, num_joints=22, traj_feat_dim=self.test_dataloader.dataset.traj_feat_dim)
 
                 train_losses = self.run_step(batch)
 
-                if self.step % self.log_interval == 0 and self.step > 0:
+                # if self.step % self.log_interval == 0 and self.step > 0:
+                if self.step % self.log_interval == 0:
                     for key in train_losses.keys():
                         self.writer.add_scalar('train/{}'.format(key), train_losses[key].item(), self.step)
                         print_str = '[Step {:d}/ Epoch {:d}] [train]  {}: {:.10f}'. format(self.step, epoch, key, train_losses[key].item())
                         self.logger.info(print_str)
                         print(print_str)
 
-                if self.step % self.log_interval == 0 and self.step > 0:
+                # if self.step % self.log_interval == 0 and self.step > 0:
+                if self.step % self.log_interval == 0:
                     self.model.eval()
                     eval_losses = {}
                     for test_step, test_batch in tqdm(enumerate(self.test_dataloader)):
                         for key in test_batch.keys():
                             test_batch[key] = test_batch[key].to(self.device)
                         shape = list(test_batch['motion_repr_clean'][:, :, 0:traj_feat_dim].shape)
+                    
+                        mask_joint_ids = set(range(22)) - set(MOCAP_VIS_MASK_IDS[self.mask_scheme])
+                        mask_joint_ids = np.asarray(list(mask_joint_ids))
+                        test_batch = mask_batch_cond(batch=test_batch, task=self.args.task, args=self.args, mask_joint_ids=mask_joint_ids, num_joints=22, traj_feat_dim=self.test_dataloader.dataset.traj_feat_dim)
+
                         eval_losses_cur_batch, val_output = self.diffusion_eval.eval_losses(model=self.model, batch=test_batch,
                                                                                   shape=shape, progress=False,
                                                                                   clip_denoised=False, cur_epoch=epoch,
@@ -117,7 +133,8 @@ class TrainLoopTrajNet:
 
                     self.model.train()
 
-                if self.step % self.save_interval == 0 and self.step > 0:
+                # if self.step % self.save_interval == 0 and self.step > 0:
+                if self.step % self.save_interval == 0:
                     self.save()
 
                 self.step += 1

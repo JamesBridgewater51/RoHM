@@ -348,14 +348,14 @@ def recover_from_repr_smpl(data_dict, recover_mode='joint_abs_traj', smplx_model
         print('[ERROR] recover_mode incorrect! in func recover_from_repr_smpl()')
     if recover_mode[0:5] == 'joint':
         root_rot_angle = data_dict['root_rot_angle']
-        root_rot_angle_vel = data_dict['root_rot_angle_vel']
         root_l_pos = data_dict['root_l_pos']
-        root_l_vel = data_dict['root_l_vel']
         root_height = data_dict['root_height']
         if recover_mode == 'joint_abs_traj':
             root_traj_repr = torch.cat([root_rot_angle, root_l_pos, root_height], axis=-1)  # [..., 4]
             r_rot_quat, r_pos = recover_root_rot_pos(data=root_traj_repr, root_traj_repr='abs', up_axis='z')
         elif recover_mode == 'joint_rel_traj':
+            root_rot_angle_vel = data_dict['root_rot_angle_vel']
+            root_l_vel = data_dict['root_l_vel']
             root_traj_repr = torch.cat([root_rot_angle_vel, root_l_vel, root_height], axis=-1)  # [..., 4]
             r_rot_quat, r_pos = recover_root_rot_pos(data=root_traj_repr, root_traj_repr='rel', up_axis='z')
 

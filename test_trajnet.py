@@ -46,6 +46,7 @@ group.add_argument("--noise_std_smplx_betas", default=0.1, type=float, help="noi
 ####################### test setups
 group.add_argument("--batch_size", default=64, type=int, help="Batch size during test.")
 group.add_argument('--infill_traj', default='False', type=lambda x: x.lower() in ['true', '1'])
+group.add_argument("--mask_scheme", default='upper_body', type=str, choices=['head_only', 'lower_body', 'upper_body', 'head_with_two_hands', 'head_with_two_hands_and_two_feets'], help='occlusion setup for test')
 group.add_argument("--max_infill_ratio", default=0.1, type=float, help="maximum occlusion ratio for traj infilling")
 group.add_argument('--visualize', default='True', type=lambda x: x.lower() in ['true', '1'])
 
@@ -79,8 +80,9 @@ def main(args):
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, drop_last=False)
 
     print("creating model and diffusion...")
+    traj_feat_dim = 22*3 if args.repr_abs_only else 22*3+22*3
     model = TrajNet(time_dim=32, mid_dim=512,
-                    cond_dim=test_dataset.traj_feat_dim, traj_feat_dim=test_dataset.traj_feat_dim,
+                    cond_dim=traj_feat_dim, traj_feat_dim=test_dataset.traj_feat_dim,
                     trajcontrol=args.trajcontrol,
                     device=dist_util.dev(),
                     dataset=test_dataset,
@@ -137,6 +139,7 @@ def main(args):
 
         #################################### add mask
         if args.infill_traj:
+            raise DeprecationWarning("Infilling task is no longer supported, please use the 'mask_scheme' argument to mask out joints.")
             max_mask_ratio = args.max_infill_ratio
             start = torch.FloatTensor(batch_size).uniform_(0, clip_len - 1).long()
             mask_len = (clip_len * torch.FloatTensor(batch_size).uniform_(0, 1) * max_mask_ratio).long()
@@ -157,23 +160,11 @@ def main(args):
                                                              timestep_respacing=args.timestep_respacing_eval,
                                                              cond_fn_with_grad=False,
                                                              smplx_model=smplx_neutral)
-        if not args.repr_abs_only:
-            motion_repr_clean_root_rec = torch.cat([val_output, test_batch['motion_repr_clean'][:, :, traj_feat_dim:]], dim=-1)
-            motion_repr_clean_root_noisy = test_batch['motion_repr_clean'].clone()
-            motion_repr_clean_root_noisy[:, :, 0:traj_feat_dim] = test_batch['motion_repr_noisy'][:, :, 0:traj_feat_dim]
-        else:
-            motion_repr_clean_root_rec = test_batch['motion_repr_clean'].clone()
-            motion_repr_clean_root_rec[..., 0] = val_output[..., 0]
-            motion_repr_clean_root_rec[..., 2:4] = val_output[..., 1:3]
-            motion_repr_clean_root_rec[..., 6] = val_output[..., 3]
-            motion_repr_clean_root_rec[..., 7:13] = val_output[..., 4:10]
-            motion_repr_clean_root_rec[..., 16:19] = val_output[..., 10:13]
-            motion_repr_clean_root_noisy = test_batch['motion_repr_clean'].clone()
-            motion_repr_clean_root_noisy[..., 0] = test_batch['motion_repr_noisy'][..., 0]
-            motion_repr_clean_root_noisy[..., 2:4] = test_batch['motion_repr_noisy'][..., 2:4]
-            motion_repr_clean_root_noisy[..., 6] = test_batch['motion_repr_noisy'][..., 6]
-            motion_repr_clean_root_noisy[..., 7:13] = test_batch['motion_repr_noisy'][..., 7:13]
-            motion_repr_clean_root_noisy[..., 16:19] = test_batch['motion_repr_noisy'][..., 16:19]
+
+        motion_repr_clean_root_rec = torch.cat([val_output, test_batch['motion_repr_clean'][:, :, traj_feat_dim:]], dim=-1)
+        motion_repr_clean_root_noisy = test_batch['motion_repr_clean'].clone()
+        motion_repr_clean_root_noisy[:, :, 0:traj_feat_dim] = test_batch['motion_repr_noisy'][:, :, 0:traj_feat_dim]
+
         motion_repr_clean = test_batch['motion_repr_clean']
 
         motion_repr_clean = (motion_repr_clean.detach().cpu().numpy()) * test_dataset.Std + test_dataset.Mean
@@ -184,7 +175,7 @@ def main(args):
         ###### clean motion
         cur_total_dim = 0
         repr_dict_clean = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_dataset.repr_list:
             repr_dict_clean[repr_name] = motion_repr_clean[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_clean[repr_name] = torch.from_numpy(repr_dict_clean[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -195,7 +186,7 @@ def main(args):
         ###### rec motion from abs traj / smpl params
         cur_total_dim = 0
         repr_dict_rec = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_dataset.repr_list:
             repr_dict_rec[repr_name] = motion_repr_clean_root_rec[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_rec[repr_name] = torch.from_numpy(repr_dict_rec[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]
@@ -210,7 +201,7 @@ def main(args):
 
         cur_total_dim = 0
         repr_dict_noisy = {}
-        for repr_name in REPR_LIST:
+        for repr_name in test_dataset.repr_list:
             repr_dict_noisy[repr_name] = motion_repr_clean_root_noisy[..., cur_total_dim:(cur_total_dim + REPR_DIM_DICT[repr_name])]
             repr_dict_noisy[repr_name] = torch.from_numpy(repr_dict_noisy[repr_name]).to(dist_util.dev())
             cur_total_dim += REPR_DIM_DICT[repr_name]

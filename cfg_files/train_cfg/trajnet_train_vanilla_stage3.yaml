@@ -34,8 +34,9 @@ weight_loss_root_rot_cos_smooth_from_abs_traj: 1.0
 batch_size: 64
 debug: False
 max_infill_ratio: 0.1
-start_infill_epoch: 0
+start_infill_epoch: 100000000000000000000
 mask_prob: 0.4
+mask_scheme: 'upper_body'
 save_dir: 'runs'  # todo
 lr: 1e-4
 weight_decay: 0.0

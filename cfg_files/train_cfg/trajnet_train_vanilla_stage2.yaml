@@ -36,6 +36,7 @@ debug: False
 max_infill_ratio: 0.1
 start_infill_epoch: 100000000000000000000
 mask_prob: 0.4
+mask_scheme: 'upper_body'
 save_dir: 'runs'  # todo
 lr: 1e-4
 weight_decay: 0.0

@@ -1,5 +1,5 @@
 body_model_path: 'data/body_models/smplx_model'
-dataset_root: 'datasets/AMASS_test_smplx_preprocessed'  # '/mnt/hdd/diffusion_mocap_datasets/AMASS_smplx_preprocessed'
+dataset_root: 'datasets/Nymeria_smplx_preprocessed'
 
 device: 0
 diffusion_steps: 100
@@ -13,14 +13,14 @@ repr_abs_only: True
 trajcontrol: False
 load_pretrained_backbone: False
 pretrained_backbone_path: ''
-load_pretrained_model: False
-pretrained_model_path: ''
+load_pretrained_model: True
+pretrained_model_path: 'runs/96060/model000800000.pt'   # todo: change to stage 1 checkpoint
 
 input_noise: True
-noise_std_smplx_global_rot: 1.0
-noise_std_smplx_body_rot: 1.0
-noise_std_smplx_trans: 0.01
-noise_std_smplx_betas: 0.01
+noise_std_smplx_global_rot: 2.0
+noise_std_smplx_body_rot: 2.0
+noise_std_smplx_trans: 0.03
+noise_std_smplx_betas: 0.2
 
 weight_loss_root_rec_repr: 1.0
 weight_loss_root_pos_global: 100
@@ -29,7 +29,7 @@ weight_loss_root_rot_vel_from_abs_traj: 1.0
 weight_loss_root_smplx_transl_vel: 1000
 weight_loss_root_smplx_rot_vel: 1.0
 weight_loss_root_smooth: 1.0
-weight_loss_root_rot_cos_smooth_from_abs_traj: 1.0
+weight_loss_root_rot_cos_smooth_from_abs_traj: 0.0
 
 batch_size: 64
 debug: False

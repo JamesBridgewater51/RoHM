@@ -265,7 +265,7 @@ class DataloaderNymeria(data.Dataset):
                 # do not normalize for smplx beta (already in a normal distribution) and foot contact labels (0/1 label)
                 if repr_name != 'smplx_betas' and repr_name != 'foot_contact':
                     self.Std_dict[repr_name][...] = self.Std_dict[repr_name].mean() / 1.0
-                elif repr_name == 'foot_contact':
+                elif repr_name == 'foot_contact' or repr_name == 'smplx_betas':
                     self.Std_dict[repr_name][...] = 1.0
             ######## save mean/std stats for the training data
             os.makedirs(save_dir) if not os.path.exists(save_dir) else None
@@ -283,7 +283,6 @@ class DataloaderNymeria(data.Dataset):
 
         self.Mean = np.concatenate([self.Mean_dict[key] for key in self.Mean_dict.keys()], axis=-1)
         self.Std = np.concatenate([self.Std_dict[key] for key in self.Std_dict.keys()], axis=-1)
-
 
     def __len__(self):
         return self.n_samples // self.spacing

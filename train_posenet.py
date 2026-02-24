@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from utils import dist_util
 from tensorboardX import SummaryWriter
 from train.training_loop_posenet import TrainLoopPoseNet
+from train.training_loop_posenet_random_joints_max15 import TrainLoopPoseNetRandomJointsMax15
 from data_loaders.dataloader_amass import DataloaderAMASS
 from model.posenet import PoseNet
 from diffusion import gaussian_diffusion_posenet
@@ -60,7 +61,7 @@ group.add_argument("--batch_size", default=32, type=int, help="Batch size during
 group.add_argument('--debug', default='False', type=lambda x: x.lower() in ['true', '1'], help='')
 group.add_argument("--start_prox_mask_epoch", default=500, type=int, help="which epoch to start to apply prox masks")
 group.add_argument("--mask_scheme", default='lower', type=str,
-                   choices=['lower', 'lower+upper', 'lower+full', 'lower+upper+full'])
+                   choices=['lower', 'lower+upper', 'lower+full', 'lower+upper+full', 'random_joints_max15'])
 group.add_argument("--save_dir", default='runs', type=str, help="Path to save checkpoints and results.")
 group.add_argument("--lr", default=1e-4, type=float, help="Learning rate.")
 group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
@@ -144,14 +145,24 @@ def main(args, writer, logdir, logger):
                                                device=dist_util.dev())
 
     print("Training...")
-    TrainLoopPoseNet(args, writer=writer, model=model,
-                     diffusion_train=diffusion_train, diffusion_eval=diffusion_eval,
-                     timestep_respacing_eval=args.timestep_respacing_eval,
-                     train_dataloader=train_dataloader, test_dataloader=test_dataloader,
-                     logdir=logdir, logger=logger,
-                     start_prox_mask_epoch=args.start_prox_mask_epoch, mask_scheme=args.mask_scheme,
-                     input_noise=args.input_noise, device=dist_util.dev(),
-                     ).run_loop()
+    if args.mask_scheme == 'random_joints_max15':
+        TrainLoopPoseNetRandomJointsMax15(args, writer=writer, model=model,
+                         diffusion_train=diffusion_train, diffusion_eval=diffusion_eval,
+                         timestep_respacing_eval=args.timestep_respacing_eval,
+                         train_dataloader=train_dataloader, test_dataloader=test_dataloader,
+                         logdir=logdir, logger=logger,
+                         start_prox_mask_epoch=args.start_prox_mask_epoch, mask_scheme=args.mask_scheme,
+                         input_noise=args.input_noise, device=dist_util.dev(),
+                         ).run_loop()
+    else:
+        TrainLoopPoseNet(args, writer=writer, model=model,
+                         diffusion_train=diffusion_train, diffusion_eval=diffusion_eval,
+                         timestep_respacing_eval=args.timestep_respacing_eval,
+                         train_dataloader=train_dataloader, test_dataloader=test_dataloader,
+                         logdir=logdir, logger=logger,
+                         start_prox_mask_epoch=args.start_prox_mask_epoch, mask_scheme=args.mask_scheme,
+                         input_noise=args.input_noise, device=dist_util.dev(),
+                         ).run_loop()
 
 
 if __name__ == "__main__":

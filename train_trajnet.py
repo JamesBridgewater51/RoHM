@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from utils import dist_util
 from tensorboardX import SummaryWriter
 from train.training_loop_trajnet import TrainLoopTrajNet
+from train.training_loop_trajnet_random_joints_max15 import TrainLoopTrajNetRandomJointsMax15
 from data_loaders.dataloader_amass import DataloaderAMASS
 
 from model.trajnet import TrajNet
@@ -68,6 +69,8 @@ group.add_argument('--debug', default='False', type=lambda x: x.lower() in ['tru
 group.add_argument("--max_infill_ratio", default=0.1, type=float, help="maximum occlusion ratio for traj infilling")
 group.add_argument("--mask_prob", default=0.4, type=float, help="probability to apply occlusion mask for traj infilling")
 group.add_argument("--start_infill_epoch", default=100000000000000000000, type=int, help="which epoch to start traj infilling")
+group.add_argument("--mask_scheme", default='', type=str,
+                   choices=['', 'random_joints_max15'], help='masking scheme override')
 group.add_argument("--save_dir", default='runs', type=str, help="Path to save checkpoints and results.")
 group.add_argument("--lr", default=1e-4, type=float, help="Learning rate.")
 group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
@@ -185,13 +188,22 @@ def main(args, writer, logdir, logger):
                                                timestep_respacing=args.timestep_respacing_eval, device=dist_util.dev())
 
     print("Training...")
-    TrainLoopTrajNet(args, writer=writer, model=model,
-                     diffusion_train=diffusion_train, diffusion_eval=diffusion_eval,
-                     timestep_respacing_eval=args.timestep_respacing_eval,
-                     start_infill_epoch=args.start_infill_epoch, max_infill_ratio=args.max_infill_ratio, mask_prob=args.mask_prob,
-                     train_dataloader=train_dataloader, test_dataloader=test_dataloader,
-                     logdir=logdir, logger=logger, device=dist_util.dev()
-                     ).run_loop()
+    if getattr(args, 'mask_scheme', '') == 'random_joints_max15':
+        TrainLoopTrajNetRandomJointsMax15(args, writer=writer, model=model,
+                         diffusion_train=diffusion_train, diffusion_eval=diffusion_eval,
+                         timestep_respacing_eval=args.timestep_respacing_eval,
+                         start_infill_epoch=args.start_infill_epoch, max_infill_ratio=args.max_infill_ratio, mask_prob=args.mask_prob,
+                         train_dataloader=train_dataloader, test_dataloader=test_dataloader,
+                         logdir=logdir, logger=logger, device=dist_util.dev()
+                         ).run_loop()
+    else:
+        TrainLoopTrajNet(args, writer=writer, model=model,
+                         diffusion_train=diffusion_train, diffusion_eval=diffusion_eval,
+                         timestep_respacing_eval=args.timestep_respacing_eval,
+                         start_infill_epoch=args.start_infill_epoch, max_infill_ratio=args.max_infill_ratio, mask_prob=args.mask_prob,
+                         train_dataloader=train_dataloader, test_dataloader=test_dataloader,
+                         logdir=logdir, logger=logger, device=dist_util.dev()
+                         ).run_loop()
 
 if __name__ == "__main__":
     run_id = random.randint(1, 100000)

@@ -97,6 +97,7 @@ def main(args):
     test_pose_dataset = DataloaderNymeria(preprocessed_amass_root=args.dataset_root, split='test',
                                         body_model_path=args.body_model_path,
                                         input_noise=args.input_noise,
+                                        spacing=100,
                                         noise_std_smplx_global_rot=args.noise_std_smplx_global_rot,
                                         noise_std_smplx_body_rot=args.noise_std_smplx_body_rot,
                                         noise_std_smplx_trans=args.noise_std_smplx_trans,
@@ -116,6 +117,7 @@ def main(args):
                                         body_model_path=args.body_model_path,
                                         repr_abs_only=args.repr_abs_only,
                                         input_noise=args.input_noise,
+                                        spacing=100,
                                         noise_std_smplx_global_rot=args.noise_std_smplx_global_rot,
                                         noise_std_smplx_body_rot=args.noise_std_smplx_body_rot,
                                         noise_std_smplx_trans=args.noise_std_smplx_trans,
@@ -159,35 +161,38 @@ def main(args):
                     repr_abs_only=args.repr_abs_only,
                     ).to(dist_util.dev())
 
-    model_trajnet_control = TrajNet(time_dim=32, mid_dim=512,
-                            cond_dim=test_traj_dataset.traj_feat_dim,
-                            traj_feat_dim=test_traj_dataset.traj_feat_dim,
-                            trajcontrol=True,
-                            device=dist_util.dev(),
-                            dataset=test_traj_dataset,
-                            repr_abs_only=args.repr_abs_only,
-                            ).to(dist_util.dev())
+    if args.model_path_trajnet_control:
+        model_trajnet_control = TrajNet(time_dim=32, mid_dim=512,
+                                cond_dim=test_traj_dataset.traj_feat_dim,
+                                traj_feat_dim=test_traj_dataset.traj_feat_dim,
+                                trajcontrol=True,
+                                device=dist_util.dev(),
+                                dataset=test_traj_dataset,
+                                repr_abs_only=args.repr_abs_only,
+                                ).to(dist_util.dev())
 
     print('[INFO] loaded TrajNet checkpoint path:', args.model_path_trajnet)
     weights = torch.load(args.model_path_trajnet, map_location=lambda storage, loc: storage)
     model_trajnet.load_state_dict(weights)
     model_trajnet.eval()
 
-    print('[INFO] loaded TrajNet TrajControl checkpoint path:', args.model_path_trajnet_control)
-    weights = torch.load(args.model_path_trajnet_control, map_location=lambda storage, loc: storage)
-    model_trajnet_control.load_state_dict(weights)
-    model_trajnet_control.eval()
+    if args.model_path_trajnet_control:
+        print('[INFO] loaded TrajNet TrajControl checkpoint path:', args.model_path_trajnet_control)
+        weights = torch.load(args.model_path_trajnet_control, map_location=lambda storage, loc: storage)
+        model_trajnet_control.load_state_dict(weights)
+        model_trajnet_control.eval()
 
     diffusion_trajnet_eval = create_gaussian_diffusion(args, gd=gaussian_diffusion_trajnet,
                                                        return_class=SpacedDiffusionTrajNet,
                                                        num_diffusion_timesteps=args.diffusion_steps_trajnet,
                                                        timestep_respacing=args.timestep_respacing_eval,
                                                        device=dist_util.dev())
-    diffusion_trajnet_control_eval = create_gaussian_diffusion(args, gd=gaussian_diffusion_trajnet,
-                                                               return_class=SpacedDiffusionTrajNet,
-                                                               num_diffusion_timesteps=args.diffusion_steps_trajnet,
-                                                               timestep_respacing=args.timestep_respacing_eval,
-                                                               device=dist_util.dev())
+    if args.model_path_trajnet_control:
+        diffusion_trajnet_control_eval = create_gaussian_diffusion(args, gd=gaussian_diffusion_trajnet,
+                                                                   return_class=SpacedDiffusionTrajNet,
+                                                                   num_diffusion_timesteps=args.diffusion_steps_trajnet,
+                                                                   timestep_respacing=args.timestep_respacing_eval,
+                                                                   device=dist_util.dev())
 
     smplx_neutral = smplx.create(model_path=args.body_model_path, model_type="smplx",
                                  gender='neutral', flat_hand_mean=True, use_pca=False).to(dist_util.dev())
@@ -202,6 +207,8 @@ def main(args):
     motion_repr_rec_list = []
 
     for test_step in tqdm(range(len(test_pose_dataset) // args.batch_size + 1)):
+        if test_step > 2:
+            break
         try:
             test_batch_pose = next(test_pose_dataloader_iter)
         except StopIteration:
@@ -438,42 +445,42 @@ def main(args):
             rec_ric_data_noisy, smpl_verts_noisy = recover_from_repr_smpl(repr_dict_noisy, recover_mode='smplx_params', smplx_model=smplx_neutral, return_verts=True)
             rec_ric_data_noisy = rec_ric_data_noisy.detach().cpu().numpy()
 
-        ####################################### save data #######################################
-        os.makedirs(args.save_root) if not os.path.exists(args.save_root) else None
-        rec_ric_data_clean_list.append(rec_ric_data_clean)
-        if args.input_noise:
-            rec_ric_data_noisy_list.append(rec_ric_data_noisy)
-        rec_ric_data_rec_list_from_abs_traj.append(rec_ric_data_rec_from_abs_traj)
-        rec_ric_data_rec_list_from_smpl.append(rec_ric_data_rec_from_smpl)
-        motion_repr_clean_list.append(motion_repr_clean)
-        if args.input_noise:
-            motion_repr_noisy_list.append(motion_repr_noisy)
-        motion_repr_rec_list.append(motion_repr_rec)
+    ####################################### save data #######################################
+    os.makedirs(args.save_root) if not os.path.exists(args.save_root) else None
+    rec_ric_data_clean_list.append(rec_ric_data_clean)
+    if args.input_noise:
+        rec_ric_data_noisy_list.append(rec_ric_data_noisy)
+    rec_ric_data_rec_list_from_abs_traj.append(rec_ric_data_rec_from_abs_traj)
+    rec_ric_data_rec_list_from_smpl.append(rec_ric_data_rec_from_smpl)
+    motion_repr_clean_list.append(motion_repr_clean)
+    if args.input_noise:
+        motion_repr_noisy_list.append(motion_repr_noisy)
+    motion_repr_rec_list.append(motion_repr_rec)
 
-        save_data = {}
-        save_data['mask_scheme'] = args.mask_scheme
-        save_data['repr_name_list'] = REPR_LIST
-        save_data['repr_dim_dict'] = REPR_DIM_DICT
-        save_data['rec_ric_data_clean_list'] = np.concatenate(rec_ric_data_clean_list, axis=0)
-        if args.input_noise:
-            save_data['rec_ric_data_noisy_list'] = np.concatenate(rec_ric_data_noisy_list, axis=0)
-        save_data['rec_ric_data_rec_list_from_abs_traj'] = np.concatenate(rec_ric_data_rec_list_from_abs_traj, axis=0)
-        save_data['rec_ric_data_rec_list_from_smpl'] = np.concatenate(rec_ric_data_rec_list_from_smpl, axis=0)
-        save_data['motion_repr_clean_list'] = np.concatenate(motion_repr_clean_list, axis=0)
-        if args.input_noise:
-            save_data['motion_repr_noisy_list'] = np.concatenate(motion_repr_noisy_list, axis=0)
-        save_data['motion_repr_rec_list'] = np.concatenate(motion_repr_rec_list, axis=0)
-        save_dir = 'test_nymeria_full_grad_{}_mask_{}'.format(args.cond_fn_with_grad, args.mask_scheme)
-        if args.input_noise and args.load_noise:
-            save_dir += '_noise_{}'.format(args.load_noise_level)
-        if args.infill_traj:
-            save_dir += '_infill_traj_{}'.format(args.traj_mask_ratio)
-        save_dir += '_iter_{}_iter2trajnoisy_{}_iter2posenoisy_{}_earlystop_{}_seed_{}.pkl'.\
-            format(args.sample_iter, args.iter2_cond_noisy_traj, args.iter2_cond_noisy_pose, args.early_stop, args.seed)
-        pkl_path = os.path.join(args.save_root, save_dir)
-        with open(pkl_path, 'wb') as result_file:
-            pickle.dump(save_data, result_file, protocol=2)
-        print('current data saved.')
+    save_data = {}
+    save_data['mask_scheme'] = args.mask_scheme
+    save_data['repr_name_list'] = REPR_LIST
+    save_data['repr_dim_dict'] = REPR_DIM_DICT
+    save_data['rec_ric_data_clean_list'] = np.concatenate(rec_ric_data_clean_list, axis=0)
+    if args.input_noise:
+        save_data['rec_ric_data_noisy_list'] = np.concatenate(rec_ric_data_noisy_list, axis=0)
+    save_data['rec_ric_data_rec_list_from_abs_traj'] = np.concatenate(rec_ric_data_rec_list_from_abs_traj, axis=0)
+    save_data['rec_ric_data_rec_list_from_smpl'] = np.concatenate(rec_ric_data_rec_list_from_smpl, axis=0)
+    save_data['motion_repr_clean_list'] = np.concatenate(motion_repr_clean_list, axis=0)
+    if args.input_noise:
+        save_data['motion_repr_noisy_list'] = np.concatenate(motion_repr_noisy_list, axis=0)
+    save_data['motion_repr_rec_list'] = np.concatenate(motion_repr_rec_list, axis=0)
+    save_dir = 'test_nymeria_full_grad_{}_mask_{}'.format(args.cond_fn_with_grad, args.mask_scheme)
+    if args.input_noise and args.load_noise:
+        save_dir += '_noise_{}'.format(args.load_noise_level)
+    if args.infill_traj:
+        save_dir += '_infill_traj_{}'.format(args.traj_mask_ratio)
+    save_dir += '_iter_{}_iter2trajnoisy_{}_iter2posenoisy_{}_earlystop_{}_seed_{}.pkl'.\
+        format(args.sample_iter, args.iter2_cond_noisy_traj, args.iter2_cond_noisy_pose, args.early_stop, args.seed)
+    pkl_path = os.path.join(args.save_root, save_dir)
+    with open(pkl_path, 'wb') as result_file:
+        pickle.dump(save_data, result_file, protocol=2)
+    print('current data saved.')
 
     print('test finished.')
 

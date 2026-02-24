@@ -65,7 +65,10 @@ class TrainLoopPoseNet:
         ######################################## load prox masks
         print('[INFO] loading PROX joint masks...')
         all_dataset_root = '/'.join(self.args.dataset_root.split('/')[0:-1])
-        prox_mask_dir_list = os.listdir(os.path.join(all_dataset_root, 'PROX/mask_joint'))  # ['MPH11_00034_01', 'MPH11_00150_01', ...]
+        if self.args.start_prox_mask_epoch < self.num_epochs and self.args.start_prox_mask_epoch >= 0:
+            prox_mask_dir_list = os.listdir(os.path.join(all_dataset_root, 'PROX/mask_joint'))  # ['MPH11_00034_01', 'MPH11_00150_01', ...]
+        else:
+            prox_mask_dir_list = []
         prox_mask_list = []
         clip_len = self.train_dataloader.dataset.clip_len
         for dir in tqdm(prox_mask_dir_list):

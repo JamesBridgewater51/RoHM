@@ -1,6 +1,8 @@
 import configargparse
 from tqdm import tqdm
 import pickle
+import numpy as np
+import torch
 from torch.utils.data import DataLoader
 from utils.fixseed import fixseed
 from utils import dist_util
@@ -15,6 +17,48 @@ from diffusion.respace import SpacedDiffusionPoseNet, SpacedDiffusionTrajNet
 from utils.model_util import create_gaussian_diffusion
 from utils.vis_util import *
 import smplx
+
+UNIFIED_SETTING_NAMES = {
+    0: 'upper_body_root_xyz',
+    1: 'head_xyz_rot',
+    2: 'imu6_root_leaf_xyz_rot',
+}
+UNIFIED_VISIBLE_JOINTS = {
+    0: [0, 3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+    1: [15],
+    2: [0, 15, 20, 21, 10, 11],
+}
+
+
+def mask_repr_joints(cond, joint_ids, traj_feat_dim, mask_xyz=True, mask_rot=True):
+    if len(joint_ids) == 0:
+        return
+    joint_ids = torch.as_tensor(joint_ids, dtype=torch.long, device=cond.device)
+    if mask_xyz:
+        for k in range(3):
+            cond[:, :, traj_feat_dim + joint_ids * 3 + k] = 0.
+            cond[:, :, traj_feat_dim + 22 * 3 + joint_ids * 3 + k] = 0.
+    if mask_rot:
+        rot_joint_ids = joint_ids[joint_ids > 0]
+        if len(rot_joint_ids) > 0:
+            for k in range(6):
+                cond[:, :, traj_feat_dim + 22 * 3 + 22 * 3 + (rot_joint_ids - 1) * 6 + k] = 0.
+    joint_id_set = set(joint_ids.detach().cpu().tolist())
+    if 7 in joint_id_set or 10 in joint_id_set:
+        cond[:, :, -4:-2] = 0.
+    if 8 in joint_id_set or 11 in joint_id_set:
+        cond[:, :, -2:] = 0.
+
+
+def apply_unified_setting_mask(cond, traj_feat_dim, setting_id):
+    all_joints = set(range(22))
+    visible_joints = set(UNIFIED_VISIBLE_JOINTS[setting_id])
+    hidden_joints = sorted(all_joints - visible_joints)
+    mask_repr_joints(cond, hidden_joints, traj_feat_dim, mask_xyz=True, mask_rot=True)
+    if setting_id == 0:
+        mask_repr_joints(cond, sorted(visible_joints - {0}), traj_feat_dim, mask_xyz=False, mask_rot=True)
+    cond[:, :, -4:] = 0.
+
 
 arg_formatter = configargparse.ArgumentDefaultsHelpFormatter
 cfg_parser = configargparse.YAMLConfigFileParser
@@ -59,7 +103,14 @@ group.add_argument("--batch_size", default=32, type=int, help="Batch size during
 group.add_argument('--cond_fn_with_grad', default='True', type=lambda x: x.lower() in ['true', '1'], help='use test-time guidance or not')
 group.add_argument('--infill_traj', default='False', type=lambda x: x.lower() in ['true', '1'])
 group.add_argument("--traj_mask_ratio", default=0.1, type=float, help="occlusion ratio for traj infilling, when traj is occlude, we assume full body pose is also occluded")
-group.add_argument("--mask_scheme", default='full', type=str, choices=['lower', 'upper', 'full'], help='occlusion scheme for poseNet')
+group.add_argument("--mask_scheme", default='full', type=str,
+                   choices=['lower', 'upper', 'full', 'omniposer_three_settings'],
+                   help='occlusion scheme for poseNet')
+group.add_argument('--use_setting_encoders', default='False', type=lambda x: x.lower() in ['true', '1'],
+                   help='use checkpoints trained with three setting-specific encoders')
+group.add_argument('--num_settings', default=3, type=int, help='number of unified baseline settings')
+group.add_argument('--setting_id', default=0, type=int, choices=[0, 1, 2],
+                   help='which unified setting to test when mask_scheme=omniposer_three_settings')
 group.add_argument('--save_root', type=str, default='test_results/results_amass_full', help='')
 
 group.add_argument("--sample_iter", default=2, type=int, help="how many inference iterations during test, default is 2 for results in paper")
@@ -134,11 +185,13 @@ def main(args):
                             body_model_path=args.body_model_path,
                             device=dist_util.dev(),
                             traj_feat_dim=test_pose_dataset.traj_feat_dim,
+                            use_setting_encoders=args.use_setting_encoders,
+                            num_settings=args.num_settings,
                             ).to(dist_util.dev())
 
     print('[INFO] loaded PoseNet checkpoint path:', args.model_path_posenet)
     weights = torch.load(args.model_path_posenet, map_location=lambda storage, loc: storage)
-    model_posenet.load_state_dict(weights)
+    model_posenet.load_state_dict(weights, strict=not args.use_setting_encoders)
     model_posenet.eval()
 
     diffusion_posenet_eval = create_gaussian_diffusion(args, gd=gaussian_diffusion_posenet,
@@ -155,6 +208,8 @@ def main(args):
                     device=dist_util.dev(),
                     dataset=test_traj_dataset,
                     repr_abs_only=args.repr_abs_only,
+                    use_setting_encoders=args.use_setting_encoders,
+                    num_settings=args.num_settings,
                     ).to(dist_util.dev())
 
     model_trajnet_control = TrajNet(time_dim=32, mid_dim=512,
@@ -164,16 +219,18 @@ def main(args):
                             device=dist_util.dev(),
                             dataset=test_traj_dataset,
                             repr_abs_only=args.repr_abs_only,
+                            use_setting_encoders=args.use_setting_encoders,
+                            num_settings=args.num_settings,
                             ).to(dist_util.dev())
 
     print('[INFO] loaded TrajNet checkpoint path:', args.model_path_trajnet)
     weights = torch.load(args.model_path_trajnet, map_location=lambda storage, loc: storage)
-    model_trajnet.load_state_dict(weights)
+    model_trajnet.load_state_dict(weights, strict=not args.use_setting_encoders)
     model_trajnet.eval()
 
     print('[INFO] loaded TrajNet TrajControl checkpoint path:', args.model_path_trajnet_control)
     weights = torch.load(args.model_path_trajnet_control, map_location=lambda storage, loc: storage)
-    model_trajnet_control.load_state_dict(weights)
+    model_trajnet_control.load_state_dict(weights, strict=not args.use_setting_encoders)
     model_trajnet_control.eval()
 
     diffusion_trajnet_eval = create_gaussian_diffusion(args, gd=gaussian_diffusion_trajnet,
@@ -198,6 +255,7 @@ def main(args):
     motion_repr_clean_list = []
     motion_repr_noisy_list = []
     motion_repr_rec_list = []
+    setting_id_list = []
 
     for test_step in tqdm(range(len(test_pose_dataset) // args.batch_size + 1)):
         try:
@@ -214,6 +272,11 @@ def main(args):
             test_batch_pose[key] = test_batch_pose[key].to(dist_util.dev())
         for key in test_batch_traj.keys():
             test_batch_traj[key] = test_batch_traj[key].to(dist_util.dev())
+        if args.mask_scheme == 'omniposer_three_settings' or args.use_setting_encoders:
+            cur_setting_id = torch.full((test_batch_pose['motion_repr_clean'].shape[0],), args.setting_id,
+                                        dtype=torch.long, device=dist_util.dev())
+            test_batch_pose['setting_id'] = cur_setting_id
+            test_batch_traj['setting_id'] = cur_setting_id
 
         if args.infill_traj:
             clip_len = test_batch_traj['cond'].shape[1]
@@ -336,6 +399,9 @@ def main(args):
             ######### apply occlusion masks
             mask_iter_num = args.sample_iter if args.iter2_cond_noisy_pose else 1  # for iter inference>0, do not use occlusion mask if iter2_cond_noisy_pose=False
             if iter_idx < mask_iter_num:
+                ######################## unified OmniPoser rebuttal settings
+                if args.mask_scheme == 'omniposer_three_settings':
+                    apply_unified_setting_mask(test_batch_pose['cond'], test_pose_dataset.traj_feat_dim, args.setting_id)
                 ######################## mask out lower body part
                 if args.mask_scheme == 'lower':
                     mask_joint_id = np.asarray([1, 2, 4, 5, 7, 8, 10, 11])
@@ -439,9 +505,17 @@ def main(args):
         if args.input_noise:
             motion_repr_noisy_list.append(motion_repr_noisy)
         motion_repr_rec_list.append(motion_repr_rec)
+        if args.mask_scheme == 'omniposer_three_settings' or args.use_setting_encoders:
+            setting_id_list.append(test_batch_pose['setting_id'].detach().cpu().numpy())
 
         save_data = {}
         save_data['mask_scheme'] = args.mask_scheme
+        save_data['use_setting_encoders'] = args.use_setting_encoders
+        save_data['num_settings'] = args.num_settings
+        save_data['setting_names'] = UNIFIED_SETTING_NAMES
+        save_data['visible_joint_ids_by_setting'] = UNIFIED_VISIBLE_JOINTS
+        if setting_id_list:
+            save_data['setting_id_list'] = np.concatenate(setting_id_list, axis=0)
         save_data['repr_name_list'] = REPR_LIST
         save_data['repr_dim_dict'] = REPR_DIM_DICT
         save_data['rec_ric_data_clean_list'] = np.concatenate(rec_ric_data_clean_list, axis=0)
@@ -454,6 +528,8 @@ def main(args):
             save_data['motion_repr_noisy_list'] = np.concatenate(motion_repr_noisy_list, axis=0)
         save_data['motion_repr_rec_list'] = np.concatenate(motion_repr_rec_list, axis=0)
         save_dir = 'test_amass_full_grad_{}_mask_{}'.format(args.cond_fn_with_grad, args.mask_scheme)
+        if args.mask_scheme == 'omniposer_three_settings':
+            save_dir += '_setting_{}_{}'.format(args.setting_id, UNIFIED_SETTING_NAMES[args.setting_id])
         if args.input_noise and args.load_noise:
             save_dir += '_noise_{}'.format(args.load_noise_level)
         if args.infill_traj:

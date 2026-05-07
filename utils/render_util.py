@@ -130,7 +130,7 @@ def create_pyrender_skel(joints, add_trans=None,
         if add_contact and j in [7, 10, 8, 11]:
             material = material_contact_1 if contact_lbl[contact_idx_dic[j]] == 1 else material_contact_0
         else:
-            if mask_scheme in ['lower', 'video']:
+            if mask_scheme in ['lower', 'video', 'omniposer_three_settings']:
                 material = material_joint_vis if j not in mask_joint_id else material_joint_occ
             elif mask_scheme == 'full':
                 material = material_joint_vis if (t < start or t >= end) else material_joint_occ
@@ -148,11 +148,11 @@ def create_pyrender_skel(joints, add_trans=None,
         segment = np.array([p1, p2])
         cyl = trimesh.creation.cylinder(0.01, height=None, segment=segment)
         cyl.apply_transform(add_trans)
-        if mask_scheme in ['lower', 'video']:
+        if mask_scheme in ['lower', 'video', 'omniposer_three_settings']:
             material = material_skel_vis if (index_pair[0] not in mask_joint_id and index_pair[1] not in mask_joint_id) else material_joint_occ
         elif mask_scheme == 'full':
             material = material_skel_vis if (t < start or t >= end) else material_joint_occ
-        if not (mask_scheme in ['lower', 'video'] and not add_occ_joints and (index_pair[0] in mask_joint_id or index_pair[1] in mask_joint_id)):
+        if not (mask_scheme in ['lower', 'video', 'omniposer_three_settings'] and not add_occ_joints and (index_pair[0] in mask_joint_id or index_pair[1] in mask_joint_id)):
             cyl_mesh_rec = pyrender.Mesh.from_trimesh(cyl, material=material)
             skeleton_mesh_list.append(cyl_mesh_rec)
     return skeleton_mesh_list

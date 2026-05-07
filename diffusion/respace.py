@@ -2,6 +2,7 @@
 # This code is based on https://github.com/openai/guided-diffusion
 import numpy as np
 import torch as th
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .gaussian_diffusion_trajnet import GaussianDiffusionTrajNet
 from .gaussian_diffusion_posenet import GaussianDiffusionPoseNet
@@ -186,6 +187,14 @@ class _WrappedModel:
         self.timestep_map = timestep_map
         self.rescale_timesteps = rescale_timesteps
         self.original_num_steps = original_num_steps
+
+    @property
+    def module(self):
+        # [DDP Core] Loss code can access the real model methods even when self.model is DDP.
+        model = self.model
+        while isinstance(model, DDP):
+            model = model.module
+        return model
 
     def __call__(self, x, ts, **kwargs):
         map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)

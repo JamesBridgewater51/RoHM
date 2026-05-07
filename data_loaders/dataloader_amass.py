@@ -1,9 +1,11 @@
 from torch.utils import data
 from tqdm import tqdm
 import glob
+import os
 import smplx
 from data_loaders.motion_representation import *
 import pickle as pkl
+from utils import dist_util
 from utils.other_utils import REPR_LIST, REPR_DIM_DICT
 
 
@@ -131,7 +133,7 @@ class DataloaderAMASS(data.Dataset):
                 continue
 
     def read_data(self, amass_datasets):
-        for dataset_name in tqdm(amass_datasets):
+        for dataset_name in tqdm(amass_datasets, disable=not dist_util.is_main_process()):
             self.divide_clip(dataset_name)
         self.n_samples = len(self.joints_clip_list)
         print('[INFO] {} set: get {} sub clips in total.'.format(self.split, self.n_samples))
@@ -139,7 +141,7 @@ class DataloaderAMASS(data.Dataset):
 
     def create_body_repr(self):
         smplx_noise_dict = {}
-        for i in tqdm(range(0, self.n_samples, self.spacing)):
+        for i in tqdm(range(0, self.n_samples, self.spacing), disable=not dist_util.is_main_process()):
             source_data_joints = self.joints_clip_list[i][:, 0:self.joints_num, :]  # [T, 22, 3]
             source_data_smplx = self.smplx_clip_list[i]  # [T, 178]
             smplx_params_dict = {'global_orient': source_data_smplx[:, 0:3],
@@ -262,11 +264,14 @@ class DataloaderAMASS(data.Dataset):
                 elif repr_name == 'foot_contact':
                     self.Std_dict[repr_name][...] = 1.0
             ######## save mean/std stats for the training data
-            os.makedirs(save_dir) if not os.path.exists(save_dir) else None
-            with open(os.path.join(save_dir, 'AMASS_mean.pkl'), 'wb') as result_file:
-                pkl.dump(self.Mean_dict, result_file, protocol=2)
-            with open(os.path.join(save_dir, 'AMASS_std.pkl'), 'wb') as result_file:
-                pkl.dump(self.Std_dict, result_file, protocol=2)
+            if dist_util.is_main_process():
+                # [DDP Core] Only rank 0 writes shared normalization files to avoid pickle corruption.
+                os.makedirs(save_dir) if not os.path.exists(save_dir) else None
+                with open(os.path.join(save_dir, 'AMASS_mean.pkl'), 'wb') as result_file:
+                    pkl.dump(self.Mean_dict, result_file, protocol=2)
+                with open(os.path.join(save_dir, 'AMASS_std.pkl'), 'wb') as result_file:
+                    pkl.dump(self.Std_dict, result_file, protocol=2)
+            dist_util.barrier()
 
         elif self.split == 'test':
             ######## load mean/std stats from the training data

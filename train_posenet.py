@@ -1,6 +1,7 @@
 import random
 import configargparse
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from utils import dist_util
 from tensorboardX import SummaryWriter
 from train.training_loop_posenet import TrainLoopPoseNet
@@ -98,7 +99,18 @@ def main(args, writer, logdir, logger):
                                     clip_len=args.clip_len,
                                     logdir=logdir,
                                     device=dist_util.dev())
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,num_workers=8, drop_last=False)
+    # [DDP Core] DistributedSampler shards samples per rank; DataLoader shuffle must be disabled when sampler is set.
+    train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False) if dist_util.is_distributed() else None
+    # [DDP Core] Keep CLI batch_size as global batch size; split it per rank to avoid silent DDP OOM.
+    per_rank_batch_size = max(1, args.batch_size // dist_util.get_world_size())
+    if dist_util.is_main_process() and per_rank_batch_size * dist_util.get_world_size() != args.batch_size:
+        print('[DDP Core] batch_size={} is not divisible by world_size={}; using per-rank batch_size={} (effective global batch_size={}).'.format(
+            args.batch_size, dist_util.get_world_size(), per_rank_batch_size, per_rank_batch_size * dist_util.get_world_size()))
+    train_dataloader = DataLoader(train_dataset, batch_size=per_rank_batch_size,
+                                  shuffle=(train_sampler is None), sampler=train_sampler,
+                                  num_workers=8, drop_last=False)
+    # [DDP Core] Rank 0 writes normalization stats; all ranks wait before test split reads them.
+    dist_util.barrier()
 
     test_dataset = DataloaderAMASS(preprocessed_amass_root=args.dataset_root, split='test', spacing=2,
                                    amass_datasets=amass_test_datasets,
@@ -113,7 +125,10 @@ def main(args, writer, logdir, logger):
                                    clip_len=args.clip_len,
                                    logdir=logdir,
                                    device=dist_util.dev())
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=False) if dist_util.is_distributed() else None
+    test_dataloader = DataLoader(test_dataset, batch_size=per_rank_batch_size,
+                                 shuffle=False, sampler=test_sampler,
+                                 num_workers=4, drop_last=False)
 
 
     print("creating model and diffusion...")
@@ -137,6 +152,9 @@ def main(args, writer, logdir, logger):
         model.load_state_dict(weights, strict=not args.use_setting_encoders)
         print('loaded checkpoint from {}'.format(args.pretrained_model_path))
 
+    # [DDP Core] Wrap only after checkpoint loading so saved keys stay single-rank compatible.
+    # Setting encoders are conditionally activated per sample, so their branches may be unused on a rank.
+    model = dist_util.wrap_model_ddp(model, find_unused_parameters=args.use_setting_encoders)
 
     diffusion_train = create_gaussian_diffusion(args, gd=gaussian_diffusion_posenet,
                                                 return_class=SpacedDiffusionPoseNet,
@@ -161,16 +179,24 @@ def main(args, writer, logdir, logger):
 
 
 if __name__ == "__main__":
-    run_id = random.randint(1, 100000)
+    # [DDP Core] Initialize before run directory creation so every rank shares one logdir.
+    dist_util.setup_dist(args.device)
+    run_id = random.randint(1, 100000) if dist_util.is_main_process() else None
+    run_id = dist_util.broadcast_object(run_id)
     logdir = os.path.join(args.save_dir, str(run_id))  # create new path
-    writer = SummaryWriter(log_dir=logdir)
-    print('RUNDIR: {}'.format(logdir))
-    sys.stdout.flush()
 
-    logger = get_logger(logdir)
-    logger.info('Let the games begin')  # write in log file
-    save_config(logdir, args)
+    writer = SummaryWriter(log_dir=logdir) if dist_util.is_main_process() else None
+    logger = get_logger(logdir) if dist_util.is_main_process() else None
+    if dist_util.is_main_process():
+        print('RUNDIR: {}'.format(logdir))
+        sys.stdout.flush()
+        logger.info('Let the games begin')  # write in log file
+        save_config(logdir, args)
+    dist_util.barrier()
+
     try:
         main(args, writer, logdir, logger)
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
+        dist_util.cleanup_dist()

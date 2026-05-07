@@ -59,9 +59,14 @@ class TrainLoopTrajNet:
 
     def run_loop(self):
         for epoch in range(self.num_epochs):
+            # [DDP Core] Keep DistributedSampler shuffling deterministic and different across epochs.
+            if hasattr(self.train_dataloader.sampler, 'set_epoch'):
+                self.train_dataloader.sampler.set_epoch(epoch)
+            if hasattr(self.test_dataloader.sampler, 'set_epoch'):
+                self.test_dataloader.sampler.set_epoch(epoch)
             self.model.train()
             traj_feat_dim = self.train_dataloader.dataset.traj_feat_dim
-            for batch in tqdm(self.train_dataloader):
+            for batch in tqdm(self.train_dataloader, disable=not dist_util.is_main_process()):
                 for key in batch.keys():
                     batch[key] = batch[key].to(self.device)
                 if getattr(self.model, 'use_setting_encoders', False):
@@ -89,16 +94,19 @@ class TrainLoopTrajNet:
                 train_losses = self.run_step(batch)
 
                 if self.step % self.log_interval == 0 and self.step > 0:
-                    for key in train_losses.keys():
-                        self.writer.add_scalar('train/{}'.format(key), train_losses[key].item(), self.step)
-                        print_str = '[Step {:d}/ Epoch {:d}] [train]  {}: {:.10f}'. format(self.step, epoch, key, train_losses[key].item())
-                        self.logger.info(print_str)
-                        print(print_str)
+                    # [DDP Core] Average scalar losses across ranks; only rank 0 touches TensorBoard/log files.
+                    train_losses = dist_util.reduce_mean_dict(train_losses)
+                    if dist_util.is_main_process():
+                        for key in train_losses.keys():
+                            self.writer.add_scalar('train/{}'.format(key), train_losses[key].item(), self.step)
+                            print_str = '[Step {:d}/ Epoch {:d}] [train]  {}: {:.10f}'. format(self.step, epoch, key, train_losses[key].item())
+                            self.logger.info(print_str)
+                            print(print_str)
 
                 if self.step % self.log_interval == 0 and self.step > 0:
                     self.model.eval()
                     eval_losses = {}
-                    for test_step, test_batch in tqdm(enumerate(self.test_dataloader)):
+                    for test_step, test_batch in tqdm(enumerate(self.test_dataloader), disable=not dist_util.is_main_process()):
                         for key in test_batch.keys():
                             test_batch[key] = test_batch[key].to(self.device)
                         if getattr(self.model, 'use_setting_encoders', False):
@@ -117,10 +125,14 @@ class TrainLoopTrajNet:
 
                     for key in eval_losses.keys():
                         eval_losses[key] = eval_losses[key] / (test_step + 1)
-                        self.writer.add_scalar('eval/{}'.format(key), eval_losses[key].item(), self.step)
-                        print_str = '[Step {:d}/ Epoch {:d}] [test]  {}: {:.10f}'.format(self.step, epoch, key, eval_losses[key].item())
-                        self.logger.info(print_str)
-                        print(print_str)
+                    # [DDP Core] Test sampler is sharded; reduce mean losses before rank-0 logging.
+                    eval_losses = dist_util.reduce_mean_dict(eval_losses)
+                    if dist_util.is_main_process():
+                        for key in eval_losses.keys():
+                            self.writer.add_scalar('eval/{}'.format(key), eval_losses[key].item(), self.step)
+                            print_str = '[Step {:d}/ Epoch {:d}] [test]  {}: {:.10f}'.format(self.step, epoch, key, eval_losses[key].item())
+                            self.logger.info(print_str)
+                            print(print_str)
 
                     self.model.train()
 
@@ -150,6 +162,10 @@ class TrainLoopTrajNet:
         return f"model{(self.step):09d}.pt"
 
     def save(self):
+        # [DDP Core] Only rank 0 performs checkpoint IO; fp16_util unwraps DDP to avoid `module.` checkpoint keys.
+        if not dist_util.is_main_process():
+            return
+
         def save_checkpoint(params):
             state_dict = self.mp_trainer.master_params_to_state_dict(params)
             filename = self.ckpt_file_name()

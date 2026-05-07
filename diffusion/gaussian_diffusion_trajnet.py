@@ -871,7 +871,8 @@ class GaussianDiffusionTrajNet:
             noise = th.randn_like(batch['motion_repr_clean'][:, :, 0:traj_feat_dim])  # [bs, clip_len, traj_feat_dim]
         batch['x_t'] = self.q_sample(batch['motion_repr_clean'][:, :, 0:traj_feat_dim], t, noise=noise)  # noised version of clean data x_0 at diffusion timestep t
         model_output = model(batch, self._scale_timesteps(t))  # [bs, clip_len, traj_feat_dim]
-        loss_dict = model.model.compute_losses_with_smpl(batch, model_output, smplx_model)
+        # [DDP Core] `_WrappedModel.module` unwraps DistributedDataParallel for auxiliary loss methods.
+        loss_dict = model.module.compute_losses_with_smpl(batch, model_output, smplx_model)
         return loss_dict
 
 
@@ -909,7 +910,8 @@ class GaussianDiffusionTrajNet:
         #     exit()
 
         if compute_loss:
-            loss_dict = model.model.compute_losses_with_smpl(batch, model_output, smplx_model)
+            # [DDP Core] `_WrappedModel.module` unwraps DistributedDataParallel for auxiliary loss methods.
+            loss_dict = model.module.compute_losses_with_smpl(batch, model_output, smplx_model)
         else:
             loss_dict = None
 

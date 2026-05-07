@@ -93,13 +93,22 @@ def get_param_groups_and_shapes(named_model_params):
     return [scalar_vector_named_params, matrix_named_params]
 
 
+def _unwrap_model(model):
+    while isinstance(model, nn.parallel.DistributedDataParallel):
+        model = model.module
+    return model
+
+
 def master_params_to_state_dict(
     model, param_groups_and_shapes, master_params, use_fp16
 ):
+    # [DDP Core] Save the underlying module so checkpoints stay loadable without DDP `module.` prefixes.
+    state_model = _unwrap_model(model)
     if use_fp16:
-        state_dict = model.state_dict()
+        state_dict = state_model.state_dict()
+        clean_param_groups_and_shapes = get_param_groups_and_shapes(state_model.named_parameters())
         for master_param, (param_group, _) in zip(
-            master_params, param_groups_and_shapes
+            master_params, clean_param_groups_and_shapes
         ):
             for (name, _), unflat_master_param in zip(
                 param_group, unflatten_master_params(param_group, master_param.view(-1))
@@ -107,22 +116,24 @@ def master_params_to_state_dict(
                 assert name in state_dict
                 state_dict[name] = unflat_master_param
     else:
-        state_dict = model.state_dict()
-        for i, (name, _value) in enumerate(model.named_parameters()):
+        state_dict = state_model.state_dict()
+        for i, (name, _value) in enumerate(state_model.named_parameters()):
             assert name in state_dict
             state_dict[name] = master_params[i]
     return state_dict
 
 
 def state_dict_to_master_params(model, state_dict, use_fp16):
+    # [DDP Core] Accept single-rank checkpoints when the runtime model is wrapped by DDP.
+    state_model = _unwrap_model(model)
     if use_fp16:
         named_model_params = [
-            (name, state_dict[name]) for name, _ in model.named_parameters()
+            (name, state_dict[name]) for name, _ in state_model.named_parameters()
         ]
         param_groups_and_shapes = get_param_groups_and_shapes(named_model_params)
         master_params = make_master_params(param_groups_and_shapes)
     else:
-        master_params = [state_dict[name] for name, _ in model.named_parameters()]
+        master_params = [state_dict[name] for name, _ in state_model.named_parameters()]
     return master_params
 
 
@@ -133,9 +144,11 @@ def zero_master_grads(master_params):
 
 def zero_grad(model_params):
     for param in model_params:
-        # Taken from https://pytorch.org/docs/stable/_modules/torch/optim/optimizer.html#Optimizer.add_param_group
+        # [DDP Core] DDP with gradient_as_bucket_view=True exposes grads as bucket views.
+        # In-place detach_() is illegal on those views; detach() is safe and zero_() preserves
+        # the bucket view so DDP can reuse gradient buckets without an extra allocation spike.
         if param.grad is not None:
-            param.grad.detach_()
+            param.grad = param.grad.detach()
             param.grad.zero_()
 
 

@@ -906,7 +906,8 @@ class GaussianDiffusionPoseNet:
             noise = th.randn_like(batch['motion_repr_clean'])
         batch['x_t'] = self.q_sample(batch['motion_repr_clean'], t, noise=noise)
         model_output = model(batch, self._scale_timesteps(t))
-        loss_dict = model.model.compute_losses_with_smpl(batch, model_output, smplx_model, epoch)
+        # [DDP Core] `_WrappedModel.module` unwraps DistributedDataParallel for auxiliary loss methods.
+        loss_dict = model.module.compute_losses_with_smpl(batch, model_output, smplx_model, epoch)
         return loss_dict, model_output
 
 
@@ -955,7 +956,8 @@ class GaussianDiffusionPoseNet:
         #     exit()
 
         if compute_loss:
-            loss_dict = model.model.compute_losses_with_smpl(batch, model_output, smplx_model, epoch)
+            # [DDP Core] `_WrappedModel.module` unwraps DistributedDataParallel for auxiliary loss methods.
+            loss_dict = model.module.compute_losses_with_smpl(batch, model_output, smplx_model, epoch)
         else:
             loss_dict = None
 

@@ -38,7 +38,7 @@ def vis_skeleton(joints, limbs,
         arrow.transform(transformation)
         if mask_scheme is None:
             arrow.paint_uniform_color(COLOR_GT_O3D)
-        elif mask_scheme in ['lower', 'video']:
+        elif mask_scheme in ['lower', 'video', 'omniposer_three_settings']:
             if limb[0] in cur_mask_joint_id or limb[1] in cur_mask_joint_id:
                 arrow.paint_uniform_color(color_occ)
             else:

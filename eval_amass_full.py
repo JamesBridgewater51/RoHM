@@ -21,8 +21,10 @@ group.add_argument('--body_model_path', type=str, default='data/body_models/smpl
 group.add_argument('--saved_data_path', type=str,
                    default='data/test_results_release/results_amass_full/test_amass_full_grad_True_mask_lower_noise_3_iter_2_iter2trajnoisy_True_iter2posenoisy_True_earlystop_False_seed_0.pkl',
                    help='path to saved test results')
-group.add_argument("--mask_scheme", default='lower', type=str, choices=['lower', 'full'], help='occlusion setup for test, full denotes traj+body occluded together')
+group.add_argument("--mask_scheme", default='lower', type=str, choices=['lower', 'full', 'omniposer_three_settings'], help='occlusion setup for test, full denotes traj+body occluded together')
 group.add_argument("--traj_mask_ratio", default=0.0, type=float, help="occlusion ratio for traj infilling, when traj is occlude, we assume full body pose is also occluded")
+group.add_argument('--setting_id', default=0, type=int, choices=[0, 1, 2],
+                   help='fallback unified setting id if saved results do not contain setting metadata')
 
 group.add_argument('--visualize', default='False', type=lambda x: x.lower() in ['true', '1'])
 group.add_argument("--vis_interval", default=100, type=int, help="visualize every N clips")
@@ -35,6 +37,28 @@ group.add_argument("--render_save_path", default='render_imgs/render_amass/mask_
 
 args = group.parse_args()
 dist_util.setup_dist(args.device)
+
+DEFAULT_UNIFIED_VISIBLE_JOINTS = {
+    0: [0, 3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+    1: [15],
+    2: [0, 15, 20, 21, 10, 11],
+}
+DEFAULT_UNIFIED_SETTING_NAMES = {
+    0: 'upper_body_root_xyz',
+    1: 'head_xyz_rot',
+    2: 'imu6_root_leaf_xyz_rot',
+}
+
+
+def normalize_setting_dict(setting_dict):
+    return {int(key): value for key, value in setting_dict.items()}
+
+
+def get_hidden_joints_for_setting(setting_id, visible_joint_ids_by_setting):
+    visible_joints = set(visible_joint_ids_by_setting[int(setting_id)])
+    return sorted(set(range(22)) - visible_joints)
+
+
 smplx_neutral = smplx.create(model_path=args.body_model_path, model_type="smplx",
                                  gender='neutral', flat_hand_mean=True, use_pca=False).to(dist_util.dev())
 
@@ -67,18 +91,28 @@ if __name__ == "__main__":
     n_seq = len(rec_ric_data_clean_list)
     clip_len = rec_ric_data_clean_list.shape[1]
     print('n_seq: ', n_seq)
+    mask_scheme = saved_data.get('mask_scheme', args.mask_scheme)
+    visible_joint_ids_by_setting = normalize_setting_dict(
+        saved_data.get('visible_joint_ids_by_setting', DEFAULT_UNIFIED_VISIBLE_JOINTS)
+    )
+    setting_names = normalize_setting_dict(saved_data.get('setting_names', DEFAULT_UNIFIED_SETTING_NAMES))
+    if 'setting_id_list' in saved_data:
+        setting_id_list = np.asarray(saved_data['setting_id_list']).astype(np.int64)
+    else:
+        setting_id_list = np.full(n_seq, args.setting_id, dtype=np.int64)
 
     ################# mpjpe for all/visible/occluded joints
     joints_mpjpe_global = np.linalg.norm(rec_ric_data_clean_list - rec_ric_data_rec_list_from_smpl, axis=-1)  # [n_seq, clip_len, 22]
     print('mpjpe_global (mm): {:0.1f}'.format(np.mean(joints_mpjpe_global) * 1000))
     start, end = 0, 0
-    if args.mask_scheme == 'lower':
+    mask_joint_id = None
+    if mask_scheme == 'lower':
         mask_joint_id = np.asarray([1, 2, 4, 5, 7, 8, 10, 11])
         vis_joint_id = set(range(22)) - set(mask_joint_id)
         joints_mpjpe_global_vis = joints_mpjpe_global[:, :, list(vis_joint_id)]
         joints_mpjpe_global_invis = joints_mpjpe_global[:, :, mask_joint_id]
         print('mpjpe_global_vis / occ (mm): {:0.1f} / {:0.1f}'.format(np.mean(joints_mpjpe_global_vis) * 1000, np.mean(joints_mpjpe_global_invis) * 1000))
-    elif args.mask_scheme == 'full':
+    elif mask_scheme == 'full':
         # default setup for tab.1 in the paper
         start = 65
         mask_len = int(args.traj_mask_ratio * 145)
@@ -86,6 +120,26 @@ if __name__ == "__main__":
         joints_mpjpe_global_vis = np.concatenate([joints_mpjpe_global[:, 0:start, ], joints_mpjpe_global[:, end:, ]], axis=1)
         joints_mpjpe_global_invis = joints_mpjpe_global[:, start:end, ]
         print('mpjpe_global_vis / occ (mm): {:0.1f} / {:0.1f}'.format(np.mean(joints_mpjpe_global_vis) * 1000, np.mean(joints_mpjpe_global_invis) * 1000))
+    elif mask_scheme == 'omniposer_three_settings':
+        per_setting_vis = []
+        per_setting_invis = []
+        for setting_id in sorted(visible_joint_ids_by_setting.keys()):
+            seq_mask = setting_id_list == setting_id
+            if not seq_mask.any():
+                continue
+            vis_joint_id = np.asarray(visible_joint_ids_by_setting[setting_id], dtype=np.int64)
+            mask_joint_id_cur = np.asarray(get_hidden_joints_for_setting(setting_id, visible_joint_ids_by_setting), dtype=np.int64)
+            joints_mpjpe_global_vis = joints_mpjpe_global[seq_mask][:, :, vis_joint_id]
+            joints_mpjpe_global_invis = joints_mpjpe_global[seq_mask][:, :, mask_joint_id_cur]
+            vis_mpjpe = np.mean(joints_mpjpe_global_vis) * 1000
+            invis_mpjpe = np.mean(joints_mpjpe_global_invis) * 1000
+            per_setting_vis.append(vis_mpjpe)
+            per_setting_invis.append(invis_mpjpe)
+            print('setting {} ({}) mpjpe_global_vis / occ (mm): {:0.1f} / {:0.1f}'.format(
+                setting_id, setting_names.get(setting_id, 'unknown'), vis_mpjpe, invis_mpjpe))
+        if per_setting_vis:
+            print('macro setting mpjpe_global_vis / occ (mm): {:0.1f} / {:0.1f}'.format(
+                np.mean(per_setting_vis), np.mean(per_setting_invis)))
 
     ################ calculate contact lbls acc
     contact_lbl_rec_list = motion_repr_rec_list[:, :, -4:]  # np, [n_seq, clip_len, 4]
@@ -199,13 +253,18 @@ if __name__ == "__main__":
 
                 for t in range(clip_len):
                     ############################################# body skeletons
-                    cur_mask_joint_id = mask_joint_id.tolist() if args.mask_scheme == 'lower' or args.mask_scheme == 'video' else None
+                    if mask_scheme in ['lower', 'video']:
+                        cur_mask_joint_id = mask_joint_id.tolist()
+                    elif mask_scheme == 'omniposer_three_settings':
+                        cur_mask_joint_id = get_hidden_joints_for_setting(setting_id_list[bs], visible_joint_ids_by_setting)
+                    else:
+                        cur_mask_joint_id = None
                     skeleton_gt_list = vis_skeleton(joints=rec_ric_data_clean_list[bs, t], limbs=LIMBS_BODY_SMPL, add_trans=np.array([0, 2.0, 2.5]))
                     skeleton_rec_list = vis_skeleton(joints=rec_ric_data_rec_list_from_smpl[bs, t], limbs=LIMBS_BODY_SMPL, add_trans=np.array([0, 0.0, 2.5]),
-                                                     mask_scheme=args.mask_scheme, cur_mask_joint_id=cur_mask_joint_id)
+                                                     mask_scheme=mask_scheme, cur_mask_joint_id=cur_mask_joint_id)
                     if input_noise:
                         skeleton_noisy_list = vis_skeleton(joints=rec_ric_data_noisy_list[bs, t], limbs=LIMBS_BODY_SMPL, add_trans=np.array([0, 1.0, 2.5]),
-                                                           mask_scheme=args.mask_scheme, cur_mask_joint_id=cur_mask_joint_id)
+                                                           mask_scheme=mask_scheme, cur_mask_joint_id=cur_mask_joint_id)
 
                     ############################################# foot contact labels
                     foot_sphere_clean_list = vis_foot_contact(joints=rec_ric_data_clean_list[bs, t], contact_lbl=contact_lbl_clean_list[bs, t], add_trans=np.array([0, 2.0, 0.0]))
@@ -291,17 +350,21 @@ if __name__ == "__main__":
                               [0, -1, 0, 1],
                               [0, 0, 0, 1]])
         ground_mesh = create_floor(cam_trans)
-        if args.mask_scheme == 'lower':
+        if mask_scheme == 'lower':
             cur_mask_joint_id = mask_joint_id.tolist()
             smplx_segment = json.load(open('data/smplx_vert_segmentation.json'))
             lower_body_verts_list = smplx_segment['leftLeg'] + smplx_segment['rightLeg'] + \
                                     smplx_segment['leftToeBase'] + smplx_segment['rightToeBase'] + \
                                     smplx_segment['leftFoot'] + smplx_segment['rightFoot'] + \
                                     smplx_segment['leftUpLeg'] + smplx_segment['rightUpLeg']
-        elif args.mask_scheme == 'full':
+        elif mask_scheme == 'full':
             cur_mask_joint_id = None
+        elif mask_scheme == 'omniposer_three_settings':
+            cur_mask_joint_id = get_hidden_joints_for_setting(args.setting_id, visible_joint_ids_by_setting)
 
         for bs in range(0, n_seq, args.render_interval):
+            if mask_scheme == 'omniposer_three_settings':
+                cur_mask_joint_id = get_hidden_joints_for_setting(setting_id_list[bs], visible_joint_ids_by_setting)
             ################### get smplx vertices
             cur_total_dim = 0
             repr_dict_clean = {}
@@ -335,11 +398,11 @@ if __name__ == "__main__":
 
                 ################### add body mesh
                 body_mesh_gt = create_pyrender_mesh(verts=smpl_verts_rec[t], faces=smplx_neutral.faces, trans=cam_trans, material=material_body_gt)
-                if args.mask_scheme == 'lower' or (args.mask_scheme == 'full' and (t < start or t >= end)):
+                if mask_scheme == 'lower' or (mask_scheme == 'full' and (t < start or t >= end)):
                     body_mesh_rec = create_pyrender_mesh(verts=smpl_verts_rec[t], faces=smplx_neutral.faces, trans=cam_trans, material=material_body_rec_vis)
                 else:
                     body_mesh_rec = create_pyrender_mesh(verts=smpl_verts_rec[t], faces=smplx_neutral.faces, trans=cam_trans, material=material_body_rec_occ)
-                if args.mask_scheme == 'lower':
+                if mask_scheme == 'lower':
                     vertex_colors = np.tile([198 / 255, 226 / 255, 255 / 255], (10475, 1))
                     vertex_alpha = np.ones((10475, 1))
                     vertex_alpha[lower_body_verts_list] = 0.1
@@ -354,9 +417,9 @@ if __name__ == "__main__":
 
                 ################## add body skeleton
                 skeleton_mesh_rec_list = create_pyrender_skel(joints=rec_ric_data_rec_list_from_smpl[bs, t], add_trans=np.linalg.inv(cam_trans),
-                                                              mask_scheme=args.mask_scheme, mask_joint_id=cur_mask_joint_id, add_occ_joints=True,
+                                                              mask_scheme=mask_scheme, mask_joint_id=cur_mask_joint_id, add_occ_joints=True,
                                                               add_contact=True, t=t, start=start, end=end, contact_lbl=contact_lbl_rec_list[bs, t])
-                skeleton_mesh_noisy_list = create_pyrender_skel(joints=rec_ric_data_noisy_list[bs, t], add_trans=np.linalg.inv(cam_trans), mask_scheme=args.mask_scheme,
+                skeleton_mesh_noisy_list = create_pyrender_skel(joints=rec_ric_data_noisy_list[bs, t], add_trans=np.linalg.inv(cam_trans), mask_scheme=mask_scheme,
                                                                 mask_joint_id=cur_mask_joint_id, add_occ_joints=False, t=t, start=start, end=end, add_contact=False,)
                 for mesh in skeleton_mesh_rec_list:
                     scene_rec_skel.add(mesh, 'pred_joint')
@@ -376,7 +439,7 @@ if __name__ == "__main__":
 
                 ####### render: noisy body
                 alpha = 1.0
-                if args.mask_scheme == 'full':
+                if mask_scheme == 'full':
                     if t >= start and t < end:
                         alpha = 0.5
                 color_noisy_body = render_img(r, scene_noisy_body, alpha=alpha)

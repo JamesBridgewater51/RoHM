@@ -60,7 +60,11 @@ group.add_argument("--batch_size", default=32, type=int, help="Batch size during
 group.add_argument('--debug', default='False', type=lambda x: x.lower() in ['true', '1'], help='')
 group.add_argument("--start_prox_mask_epoch", default=500, type=int, help="which epoch to start to apply prox masks")
 group.add_argument("--mask_scheme", default='lower', type=str,
-                   choices=['lower', 'lower+upper', 'lower+full', 'lower+upper+full'])
+                   choices=['lower', 'lower+upper', 'lower+full', 'lower+upper+full',
+                            'random_joints_max15', 'omniposer_three_settings'])
+group.add_argument('--use_setting_encoders', default='False', type=lambda x: x.lower() in ['true', '1'],
+                   help='use three setting-specific encoders before the shared backbone')
+group.add_argument('--num_settings', default=3, type=int, help='number of unified baseline settings')
 group.add_argument("--save_dir", default='runs', type=str, help="Path to save checkpoints and results.")
 group.add_argument("--lr", default=1e-4, type=float, help="Learning rate.")
 group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
@@ -125,10 +129,12 @@ def main(args, writer, logdir, logger):
                     weight_loss_joint_smooth=args.weight_loss_joint_smooth,
                     weight_loss_foot_skating=args.weight_loss_foot_skating,
                     start_skating_loss_epoch=args.start_skating_loss_epoch,
+                    use_setting_encoders=args.use_setting_encoders,
+                    num_settings=args.num_settings,
                     ).to(dist_util.dev())
     if args.load_pretrained_model:
         weights = torch.load(args.pretrained_model_path, map_location=lambda storage, loc: storage)
-        model.load_state_dict(weights)
+        model.load_state_dict(weights, strict=not args.use_setting_encoders)
         print('loaded checkpoint from {}'.format(args.pretrained_model_path))
 
 
@@ -164,4 +170,7 @@ if __name__ == "__main__":
     logger = get_logger(logdir)
     logger.info('Let the games begin')  # write in log file
     save_config(logdir, args)
-    main(args, writer, logdir, logger)
+    try:
+        main(args, writer, logdir, logger)
+    finally:
+        writer.close()

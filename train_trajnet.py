@@ -44,6 +44,9 @@ group.add_argument('--pretrained_backbone_path', type=str, default='', help='')
 ### load pretrained checkpoints
 group.add_argument('--load_pretrained_model', default='False', type=lambda x: x.lower() in ['true', '1'], help='if load pretrained checkpoint')
 group.add_argument('--pretrained_model_path', type=str, default='', help='')
+group.add_argument('--use_setting_encoders', default='False', type=lambda x: x.lower() in ['true', '1'],
+                   help='use three setting-specific encoders before the shared backbone')
+group.add_argument('--num_settings', default=3, type=int, help='number of unified baseline settings')
 
 ######################## input noise scaling setups
 group.add_argument('--input_noise', default='True', type=lambda x: x.lower() in ['true', '1'], help='if add nosie to input conditions')
@@ -131,6 +134,8 @@ def main(args, writer, logdir, logger):
                     device=dist_util.dev(),
                     dataset=train_dataset,
                     repr_abs_only=args.repr_abs_only,
+                    use_setting_encoders=args.use_setting_encoders,
+                    num_settings=args.num_settings,
                     weight_loss_root_rec_repr=args.weight_loss_root_rec_repr,
                     weight_loss_root_smooth=args.weight_loss_root_smooth,
                     weight_loss_root_pos_global=args.weight_loss_root_pos_global,
@@ -143,7 +148,7 @@ def main(args, writer, logdir, logger):
 
     if args.load_pretrained_model:
         weights = torch.load(args.pretrained_model_path, map_location=lambda storage, loc: storage)
-        model.load_state_dict(weights)
+        model.load_state_dict(weights, strict=not args.use_setting_encoders)
         print('loaded checkpoint from {}'.format(args.pretrained_model_path))
 
     if args.trajcontrol and args.load_pretrained_backbone:
@@ -203,4 +208,7 @@ if __name__ == "__main__":
     logger = get_logger(logdir)
     logger.info('Let the games begin')  # write in log file
     save_config(logdir, args)
-    main(args, writer, logdir, logger)
+    try:
+        main(args, writer, logdir, logger)
+    finally:
+        writer.close()

@@ -60,12 +60,63 @@ class TrainLoopPoseNet:
         self.schedule_sampler_type = 'uniform'
         self.schedule_sampler = create_named_schedule_sampler(self.schedule_sampler_type, diffusion_train)
 
+    def _mask_joints(self, cond, joint_ids, traj_feat_dim, mask_xyz=True, mask_rot=True):
+        if len(joint_ids) == 0:
+            return
+        joint_ids = torch.as_tensor(joint_ids, dtype=torch.long, device=cond.device)
+        if mask_xyz:
+            for k in range(3):
+                cond[:, :, traj_feat_dim + joint_ids * 3 + k] = 0.
+                cond[:, :, traj_feat_dim + 22 * 3 + joint_ids * 3 + k] = 0.
+        if mask_rot:
+            rot_joint_ids = joint_ids[joint_ids > 0]
+            if len(rot_joint_ids) > 0:
+                for k in range(6):
+                    cond[:, :, traj_feat_dim + 22 * 3 + 22 * 3 + (rot_joint_ids - 1) * 6 + k] = 0.
+        joint_id_set = set(joint_ids.detach().cpu().tolist())
+        if 7 in joint_id_set or 10 in joint_id_set:
+            cond[:, :, -4:-2] = 0.
+        if 8 in joint_id_set or 11 in joint_id_set:
+            cond[:, :, -2:] = 0.
+
+    def _apply_unified_setting_mask(self, batch, traj_feat_dim, setting_id=None):
+        bs = batch['cond'].shape[0]
+        all_joints = set(range(22))
+        upper_body_visible = {0, 3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+        head_visible = {15}
+        imu6_visible = {0, 15, 20, 21, 10, 11}
+        visible_by_setting = [upper_body_visible, head_visible, imu6_visible]
+        if setting_id is None:
+            batch['setting_id'] = torch.randint(0, len(visible_by_setting), (bs,), device=self.device)
+        else:
+            batch['setting_id'] = torch.full((bs,), setting_id, dtype=torch.long, device=self.device)
+        for setting_idx, visible_joints in enumerate(visible_by_setting):
+            sample_mask = batch['setting_id'] == setting_idx
+            if not sample_mask.any():
+                continue
+            hidden_joints = sorted(all_joints - visible_joints)
+            cur_cond = batch['cond'][sample_mask]
+            if setting_idx == 0:
+                self._mask_joints(cur_cond, hidden_joints, traj_feat_dim, mask_xyz=True, mask_rot=True)
+                self._mask_joints(cur_cond, sorted(visible_joints - {0}), traj_feat_dim, mask_xyz=False, mask_rot=True)
+            else:
+                self._mask_joints(cur_cond, hidden_joints, traj_feat_dim, mask_xyz=True, mask_rot=True)
+            batch['cond'][sample_mask] = cur_cond
+        batch['cond'][:, :, -4:] = 0.
+
 
     def run_loop(self):
         ######################################## load prox masks
-        print('[INFO] loading PROX joint masks...')
-        all_dataset_root = '/'.join(self.args.dataset_root.split('/')[0:-1])
-        prox_mask_dir_list = os.listdir(os.path.join(all_dataset_root, 'PROX/mask_joint'))  # ['MPH11_00034_01', 'MPH11_00150_01', ...]
+        if self.mask_scheme == 'omniposer_three_settings':
+            print('[INFO] skipping PROX joint masks loading for omniposer_three_settings...')
+            prox_mask_dir_list = []
+        else:
+            print('[INFO] loading PROX joint masks...')
+            all_dataset_root = '/'.join(self.args.dataset_root.split('/')[0:-1])
+            if self.args.start_prox_mask_epoch < self.num_epochs and self.args.start_prox_mask_epoch >= 0:
+                prox_mask_dir_list = os.listdir(os.path.join(all_dataset_root, 'PROX/mask_joint'))  # ['MPH11_00034_01', 'MPH11_00150_01', ...]
+            else:
+                prox_mask_dir_list = []
         prox_mask_list = []
         clip_len = self.train_dataloader.dataset.clip_len
         for dir in tqdm(prox_mask_dir_list):
@@ -111,8 +162,10 @@ class TrainLoopPoseNet:
                 bs, clip_len = batch['motion_repr_clean'].shape[0], batch['motion_repr_clean'].shape[1]
 
                 ####################### add mask, with some schedules
+                if self.mask_scheme == 'omniposer_three_settings':
+                    self._apply_unified_setting_mask(batch, traj_feat_dim)
                 # mask random 1-6 joints
-                if epoch <= self.start_prox_mask_epoch:
+                elif epoch <= self.start_prox_mask_epoch:
                     mask_joint_n = random.randint(1, 6)
                     mask_joint_id = torch.rand(bs, mask_joint_n) * 22  # all 22 joints
                     mask_joint_id = mask_joint_id.long()  # [bs, mask_joint_n]
@@ -204,6 +257,9 @@ class TrainLoopPoseNet:
                 batch['motion_repr_clean'] = torch.permute(batch['motion_repr_clean'], (0, 2, 1)).unsqueeze(-2)  # [bs, body_feat_dim, 1, clip_len]
                 batch['cond'] = torch.permute(batch['cond'], (0, 2, 1)).unsqueeze(-2)
 
+                if self.step >= self.num_steps:
+                    return
+
                 train_losses = self.run_step(batch)
 
                 if self.step % self.log_interval == 0 and self.step > 0:
@@ -225,24 +281,27 @@ class TrainLoopPoseNet:
                         bs, clip_len = test_batch['motion_repr_clean'].shape[0], test_batch['motion_repr_clean'].shape[1]
 
                         ####################### add mask, mask 1-6 joints randomly
-                        mask_joint_n = random.randint(1, 6)
-                        mask_joint_id = torch.rand(bs, mask_joint_n) * 22
-                        mask_joint_id = mask_joint_id.long()  # [bs, mask_joint_n]
-                        mask_joint_id[mask_joint_id == 0] = 1  # do not mask out pelvis joint
-                        for i in range(bs):
-                            for k in range(3):
-                                test_batch['cond'][i, :, traj_feat_dim + mask_joint_id[i] * 3 + k] = 0.
-                            for k in range(3):
-                                test_batch['cond'][i, :, traj_feat_dim + 22 * 3 + mask_joint_id[i] * 3 + k] = 0.
-                            for k in range(6):
-                                test_batch['cond'][i, :,
-                                traj_feat_dim + 22 * 3 + 22 * 3 + (mask_joint_id[i] - 1) * 6 + k] = 0.
-                            if 7 in mask_joint_id[i] or 10 in mask_joint_id[i]:  # left foot
-                                test_batch['cond'][i, :, -4:-2] = 0.
-                            if 8 in mask_joint_id[i] or 11 in mask_joint_id[i]:  # right foot
-                                test_batch['cond'][i, :, -2:] = 0.
-                        if self.input_noise:
-                            test_batch['cond'][:, :, -4:] = 0.
+                        if self.mask_scheme == 'omniposer_three_settings':
+                            self._apply_unified_setting_mask(test_batch, traj_feat_dim, setting_id=test_step % 3)
+                        else:
+                            mask_joint_n = random.randint(1, 6)
+                            mask_joint_id = torch.rand(bs, mask_joint_n) * 22
+                            mask_joint_id = mask_joint_id.long()  # [bs, mask_joint_n]
+                            mask_joint_id[mask_joint_id == 0] = 1  # do not mask out pelvis joint
+                            for i in range(bs):
+                                for k in range(3):
+                                    test_batch['cond'][i, :, traj_feat_dim + mask_joint_id[i] * 3 + k] = 0.
+                                for k in range(3):
+                                    test_batch['cond'][i, :, traj_feat_dim + 22 * 3 + mask_joint_id[i] * 3 + k] = 0.
+                                for k in range(6):
+                                    test_batch['cond'][i, :,
+                                    traj_feat_dim + 22 * 3 + 22 * 3 + (mask_joint_id[i] - 1) * 6 + k] = 0.
+                                if 7 in mask_joint_id[i] or 10 in mask_joint_id[i]:  # left foot
+                                    test_batch['cond'][i, :, -4:-2] = 0.
+                                if 8 in mask_joint_id[i] or 11 in mask_joint_id[i]:  # right foot
+                                    test_batch['cond'][i, :, -2:] = 0.
+                            if self.input_noise:
+                                test_batch['cond'][:, :, -4:] = 0.
 
                         test_batch['motion_repr_clean'] = torch.permute(test_batch['motion_repr_clean'], (0, 2, 1)).unsqueeze(-2)  # [bs, body_feat_dim, 1, clip_len]
                         test_batch['cond'] = torch.permute(test_batch['cond'], (0, 2, 1)).unsqueeze(-2)

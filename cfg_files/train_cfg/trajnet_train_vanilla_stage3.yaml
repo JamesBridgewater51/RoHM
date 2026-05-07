@@ -15,6 +15,8 @@ load_pretrained_backbone: False
 pretrained_backbone_path: ''
 load_pretrained_model: True
 pretrained_model_path: 'runs/55292/model000400000.pt'   # todo: change to stage 2 checkpoint
+use_setting_encoders: True
+num_settings: 3
 
 input_noise: True
 noise_std_smplx_global_rot: 2.0

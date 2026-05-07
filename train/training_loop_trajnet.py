@@ -64,6 +64,8 @@ class TrainLoopTrajNet:
             for batch in tqdm(self.train_dataloader):
                 for key in batch.keys():
                     batch[key] = batch[key].to(self.device)
+                if getattr(self.model, 'use_setting_encoders', False):
+                    batch['setting_id'] = torch.randint(0, self.model.num_settings, (batch['cond'].shape[0],), device=self.device)
 
                 ######### add occlusion mask for traj repr, with some schedules
                 if epoch >= self.start_infill_epoch:
@@ -81,6 +83,9 @@ class TrainLoopTrajNet:
                         mask_traj = mask_traj.unsqueeze(-1).repeat(1, 1, traj_feat_dim)   # [bs, t, 4]
                         batch['cond'][:, :, 0:traj_feat_dim] = batch['cond'][:, :, 0:traj_feat_dim] * mask_traj
 
+                if self.step >= self.num_steps:
+                    return
+
                 train_losses = self.run_step(batch)
 
                 if self.step % self.log_interval == 0 and self.step > 0:
@@ -96,6 +101,8 @@ class TrainLoopTrajNet:
                     for test_step, test_batch in tqdm(enumerate(self.test_dataloader)):
                         for key in test_batch.keys():
                             test_batch[key] = test_batch[key].to(self.device)
+                        if getattr(self.model, 'use_setting_encoders', False):
+                            test_batch['setting_id'] = torch.zeros(test_batch['motion_repr_clean'].shape[0], dtype=torch.long, device=self.device)
                         shape = list(test_batch['motion_repr_clean'][:, :, 0:traj_feat_dim].shape)
                         eval_losses_cur_batch, val_output = self.diffusion_eval.eval_losses(model=self.model, batch=test_batch,
                                                                                   shape=shape, progress=False,

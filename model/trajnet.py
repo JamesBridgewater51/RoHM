@@ -75,6 +75,18 @@ class ControlNet(nn.Module):
             control_cond_zero_conv_4, control_cond_zero_conv_mid
 
 
+class SettingTrajEncoder(nn.Module):
+    def __init__(self, channels, hidden_channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, hidden_channels, 3, padding=1),
+            nn.Mish(),
+            nn.Conv1d(hidden_channels, channels, 3, padding=1),
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
+
 
 
 class TrajNet(nn.Module):
@@ -86,6 +98,9 @@ class TrajNet(nn.Module):
                  ####### trajcontrol setup
                  trajcontrol=False,
                  control_cond_dim=272,
+                 ####### unified baseline setting encoders
+                 use_setting_encoders=False,
+                 num_settings=3,
                  ####### loss weights
                  weight_loss_root_rec_repr=0.0,
                  weight_loss_root_pos_global=0.0, weight_loss_root_vel_global=0.0,
@@ -98,6 +113,8 @@ class TrajNet(nn.Module):
 
         self.traj_feat_dim = traj_feat_dim
         self.repr_abs_only = repr_abs_only
+        self.use_setting_encoders = use_setting_encoders
+        self.num_settings = num_settings
 
         self.trajcontrol = trajcontrol
         if self.trajcontrol:
@@ -160,6 +177,12 @@ class TrajNet(nn.Module):
             nn.Conv1d(32, self.traj_feat_dim, 1),
         )
 
+        ############### setting-specific encoders before the shared conditioning backbone
+        if self.use_setting_encoders:
+            self.setting_encoders = nn.ModuleList([
+                SettingTrajEncoder(cond_dim, mid_dim // 8) for _ in range(self.num_settings)
+            ])
+
         ############### conditioning encoder: encode noisy/occluded input traj
         self.cond_enc1 = ResidualTemporalBlock(cond_dim, mid_dim // 8, input_t=False)
         self.cond_downsample1 = Downsample1d(mid_dim // 8)
@@ -190,6 +213,14 @@ class TrajNet(nn.Module):
 
         ############## encode noisy condition: noisy traj repr
         cond = einops.rearrange(cond, 'b h t -> b t h')  # [bs, traj_dim, T]
+        if self.use_setting_encoders:
+            setting_id = batch.get('setting_id', torch.zeros(cond.shape[0], dtype=torch.long, device=cond.device)).long()
+            cond_encoded = torch.empty_like(cond)
+            for idx, encoder in enumerate(self.setting_encoders):
+                setting_mask = setting_id == idx
+                if setting_mask.any():
+                    cond_encoded[setting_mask] = encoder(cond[setting_mask])
+            cond = cond_encoded
         h_cond = []
 
         cond = self.cond_enc1(cond, None)   # [bs, mid_dim/8, T]

@@ -11,6 +11,8 @@ task: pose
 clip_len: 145
 load_pretrained_model: False
 pretrained_model_path: ''
+use_setting_encoders: True
+num_settings: 3
 
 input_noise: True
 noise_std_smplx_global_rot: 1.0
@@ -29,7 +31,7 @@ weight_loss_foot_skating: 0.1
 batch_size: 64
 debug: False
 start_prox_mask_epoch: 500
-mask_scheme: 'lower+upper+full'
+mask_scheme: 'omniposer_three_settings'
 save_dir: 'runs'  # todo
 lr: 1e-4
 weight_decay: 0.0

@@ -7,6 +7,20 @@ from data_loaders.motion_representation import recover_from_repr_smpl
 from model.heads import *
 
 
+class SettingPoseEncoder(nn.Module):
+    def __init__(self, latent_dim, ff_size, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, ff_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_size, latent_dim),
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
+
 
 class PoseNet(nn.Module):
     def __init__(self, dataset, body_feat_dim, nfeats=1,
@@ -20,12 +34,16 @@ class PoseNet(nn.Module):
                  weight_loss_joint_vel_global=0.0, weight_loss_joint_smooth=0.0,
                  weight_loss_foot_skating=0.0,
                  start_skating_loss_epoch=0,
+                 use_setting_encoders=False,
+                 num_settings=3,
                  ):
         super().__init__()
         self.dataset = dataset
         self.body_feat_dim = body_feat_dim
         self.nfeats = nfeats  # 1
         self.traj_feat_dim = traj_feat_dim
+        self.use_setting_encoders = use_setting_encoders
+        self.num_settings = num_settings
 
         # contact lbl dim order: 7, 10, 8, 11, left ankle, toe, right angle, toe
         self.foot_joint_index_list = [7, 10, 8, 11]
@@ -58,6 +76,10 @@ class PoseNet(nn.Module):
                                  gender='neutral', flat_hand_mean=True, use_pca=False).to(self.device)
         self.input_process = InputProcess(self.input_feats, self.latent_dim)
         self.input_process_cond = InputProcess(self.input_feats, self.latent_dim)
+        if self.use_setting_encoders:
+            self.setting_encoders = nn.ModuleList([
+                SettingPoseEncoder(self.latent_dim, self.ff_size, self.dropout) for _ in range(self.num_settings)
+            ])
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
         print("TRANS_ENC init")
         seqTransEncoderLayer = nn.TransformerEncoderLayer(d_model=self.latent_dim,
@@ -84,6 +106,14 @@ class PoseNet(nn.Module):
 
         x = self.input_process(batch['x_t'])
         cond = self.input_process_cond(batch['cond'])
+        if self.use_setting_encoders:
+            setting_id = batch.get('setting_id', torch.zeros(cond.shape[1], dtype=torch.long, device=cond.device)).long()
+            cond_encoded = torch.empty_like(cond)
+            for idx, encoder in enumerate(self.setting_encoders):
+                setting_mask = setting_id == idx
+                if setting_mask.any():
+                    cond_encoded[:, setting_mask] = encoder(cond[:, setting_mask])
+            cond = cond_encoded
         x = x + cond
 
         # adding the timestep embed
